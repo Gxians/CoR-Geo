@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cor-geo"
+version = "0.1.0"
+description = "Direction-level weak-order representation for limited-FoV cross-view geo-localization"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "CoR-Geo Authors" },
+]
+requires-python = ">=3.10,<3.11"
+keywords = [
+  "cross-view geo-localization",
+  "image retrieval",
+  "limited field of view",
+  "unknown orientation",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26,<2",
+  "pandas>=2.2,<2.3",
+  "pyarrow>=17,<18",
+  "Pillow>=10.4,<11",
+  "PyYAML>=6,<7",
+  "scipy>=1.13,<1.14",
+  "torch>=2.3,<2.4",
+  "torchvision>=0.18,<0.19",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.6,<0.7",
+]
+
+# Repository and paper URLs will be added after their public releases.
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src", "tests"]
+markers = [
+  "integration: requires local data or distributed execution",
+  "gpu: requires CUDA",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

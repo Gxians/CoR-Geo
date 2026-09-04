@@ -1,0 +1,65 @@
+name: cor_geo
+
+backbone:
+  name: dinov2_vitb14
+  patch_size: 14
+  output_dim: 768
+  strict_checkpoint: true
+  expected_transformer_blocks: 12
+  finetuning:
+    enabled: true
+    update_start_epoch: 9
+    trainable_blocks: [8, 9, 10, 11]
+    block_update_start_epochs: {8: 9, 9: 9, 10: 9, 11: 9}
+    train_final_norm: true
+    final_norm_update_start_epoch: 9
+    frozen_prefix_blocks: [0, 1, 2, 3, 4, 5, 6, 7]
+    train_patch_embed: false
+    train_non_block_tokens: false
+    stage_a_forward_no_grad: true
+    frozen_prefix_eval_mode: true
+    active_blocks_train_mode: true
+
+input:
+  ground_height: 224
+  panorama_width: 756
+  # Exact physical crops are taken before the small ViT-B/14 alignment resize.
+  crop_widths: {360: 756, 180: 378, 90: 189, 70: 147}
+  widths: {360: 756, 180: 378, 90: 196, 70: 154}
+  satellite_size: [378, 378]
+
+architecture:
+  name: column_ray_content_order
+  angular_bins: 36
+  angular_step_deg: 10.0
+  direction_dim: 256
+  ground_angular_resampling:
+    name: conservative_interval_overlap
+    applied_after_backbone: true
+    source_patch_columns: {360: 54, 180: 27, 90: 14, 70: 11}
+    target_direction_bins: {360: 36, 180: 18, 90: 9, 70: 7}
+  content_order_encoder:
+    input_dim: 768
+    hidden_dim: 256
+    content_dim: 128
+    order_dim: 128
+    joint_order_weight: 0.20
+    ground_sequence_length: 16
+    satellite_sequence_length: 16
+    attention_queries: 1
+    attention_scaling: inverse_sqrt_hidden_dim
+    order_pooling: normalized_first_cosine_moment
+    joint_composition: weighted_normalized_subspace_concat
+    shared_across_modalities: true
+    ground_sequence_order: bottom_to_top
+    satellite_sampling: dense_center_to_square_boundary_midpoint_bilinear_assignment
+
+score:
+  name: fov_masked_cyclic_hard_max
+  shift_reduction: hard_max
+
+loss:
+  info_nce_temperature: 0.07
+  label_smoothing: 0.1
+  symmetric: true
+  order_retrieval_weight: 0.15

@@ -1,0 +1,12 @@
+# Default repository-local layout. Run public commands from the repository root.
+project_root: .
+data_root: data
+output_root: outputs
+dinov2_root: third_party/dinov2
+
+datasets:
+  cvact: data/CVACT
+  cvusa: data/CVUSA
+
+checkpoints:
+  dinov2_vitb14: checkpoints/dinov2/dinov2_vitb14_pretrain.pth

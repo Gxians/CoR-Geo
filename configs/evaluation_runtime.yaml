@@ -1,0 +1,18 @@
+distributed:
+  backend: nccl
+  world_size: auto
+  timeout_minutes: 1440
+
+descriptor_export:
+  batch_size_per_gpu: 32
+  workers_per_rank: 12
+  progress_every_batches: 100
+
+exact_score:
+  query_chunk_size: 128
+  location_chunk_size: 2048
+
+storage:
+  descriptor_dtype: float32
+  prediction_shards: parquet
+  staging_directory: .evaluation_staging

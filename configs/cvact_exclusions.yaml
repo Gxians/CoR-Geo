@@ -1,0 +1,7 @@
+protocol_version: cvact_v2.1
+exclusions:
+  - split: train
+    query_id: 1LqOHPdTiBbRucz-jFOSbQ
+    satellite_id: 1LqOHPdTiBbRucz-jFOSbQ
+    source_mat_index: 297431
+    reason: both_ground_and_satellite_files_missing_in_reference_data_snapshot

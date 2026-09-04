@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use CoR-Geo, please cite the software and the associated paper."
+title: "CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization"
+type: software
+version: 0.1.0
+authors:
+  - name: "CoR-Geo Authors"
+abstract: >-
+  Research implementation of CoR-Geo, a direction-level weak-order
+  representation for limited-FoV cross-view geo-localization with unknown
+  relative headings.
+license: MIT

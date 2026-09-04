@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Repository-local datasets and external assets.
+# Keep the placement guide tracked while excluding downloaded dataset files.
+data/*
+!data/README.md
+third_party/
+checkpoints/
+
+# Generated manifests, caches, runs, and evaluation artifacts.
+data_manifests/**/*.parquet
+data_manifests/**/*.csv
+data_manifests/**/*.json
+.cache/
+cache/
+outputs/
+artifacts/
+predictions/
+*.mmap
+*.faiss
+*.npy
+*.npz
+*.pt
+*.safetensors
+
+# Editor and operating-system state.
+.idea/
+.vscode/
+.DS_Store
+
+# Local environment and secret material.
+.env
+.env.*
+!.env.example
+*.pem
+*.key

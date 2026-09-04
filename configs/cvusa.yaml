@@ -1,0 +1,29 @@
+dataset: cvusa
+root_key: cvusa
+protocol_version: cvusa_19zl_v1
+manifest_splits: [train, val]
+
+# These are the official 19zl split CSVs. Their source row order is retained.
+splits:
+  train:
+    csv_file: splits/train-19zl.csv
+    expected_count: 35532
+  val:
+    csv_file: splits/val-19zl.csv
+    expected_count: 8884
+
+# PIL reports sizes as [width, height].  The two modalities intentionally have
+# different native resolutions; preprocessing maps both datasets through model.yaml.
+expected_source_image_sizes:
+  query: [1232, 224]
+  satellite: [750, 750]
+  annotation: [1232, 224]
+
+satellite_inventory_root: bingmap/19
+strict_satellite_file_equality: true
+
+id_contract:
+  query_id_unique: true
+  satellite_id_unique: true
+  one_to_one: true
+  query_id_equals_satellite_id: true
