@@ -13,8 +13,6 @@ from torch.nn import functional as functional
 from cor_geo.matching import cyclic_direction_logits, cyclic_hard_max_score
 from cor_geo.model import CoRGeoOutput
 
-# ---- src/cor_geo/losses/info_nce.py ----
-
 """Content+Order hard-max retrieval without orientation supervision."""
 
 

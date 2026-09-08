@@ -13,8 +13,6 @@ from torch.utils.data import Sampler
 from cor_geo.datasets import SampleRequest
 from cor_geo.utils import stable_seed
 
-# ---- src/cor_geo/datasets/samplers.py ----
-
 """Deterministic balanced mixed-FoV batches with unique locations per epoch."""
 
 

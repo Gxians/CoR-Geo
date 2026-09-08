@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-# ---- src/cor_geo/losses/cyclic_matching.py ----
-
 """Unified hard-max cyclic location scoring for every FoV."""
 
 

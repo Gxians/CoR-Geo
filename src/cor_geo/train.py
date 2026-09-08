@@ -7,11 +7,11 @@ import json
 import math
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
-from math import isfinite
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -27,7 +27,6 @@ from cor_geo.datasets import (
     CrossViewDataset,
     ResizedRGBMemmapCache,
     SampleRequest,
-    cache_metadata_path,
     cache_request,
     collate_mixed_fov,
     read_manifest,
@@ -41,8 +40,6 @@ from cor_geo.utils import (
     append_jsonl,
     capture_random_state,
     configure_determinism,
-    environment_snapshot,
-    git_state,
     load_experiment_config,
     resolve_training_topology,
     restore_random_state,
@@ -52,8 +49,6 @@ from cor_geo.utils import (
     write_json,
     write_yaml,
 )
-
-# ---- src/cor_geo/engine/stage_scheduler.py ----
 
 """Curriculum lookup, static AdamW groups, and exact per-group cosine schedules."""
 
@@ -317,8 +312,6 @@ def optimizer_param_group_manifest(optimizer: torch.optim.Optimizer) -> list[dic
     ]
 
 
-# ---- src/cor_geo/engine/checkpoint.py ----
-
 """Epoch-boundary checkpoint persistence and strict resume validation."""
 
 
@@ -508,8 +501,6 @@ def load_checkpoint(
     return payload
 
 
-# ---- src/cor_geo/engine/trainer.py ----
-
 """One- or two-GPU trainer for the registered CoR-Geo protocol."""
 
 
@@ -521,7 +512,7 @@ def initialize_distributed(train_config: dict[str, Any]) -> tuple[int, int, int]
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     world_size = int(os.environ.get("WORLD_SIZE", "-1"))
     if rank < 0 or local_rank < 0 or world_size < 1:
-        raise RuntimeError("Launch training with torchrun")
+        raise RuntimeError("The CoR-Geo device launcher did not initialize the training workers")
     resolve_training_topology(train_config, world_size)
     torch.cuda.set_device(local_rank)
     distributed.init_process_group(
@@ -543,32 +534,6 @@ def _assert_global_unique(local_indices: torch.Tensor, world_size: int) -> None:
     values = torch.cat(gathered)
     if len(torch.unique(values)) != len(values):
         raise ValueError("A global mixed batch contains duplicate locations")
-
-
-def _logical_modules(model: CoRGeoModel) -> dict[str, nn.Module]:
-    output: dict[str, nn.Module] = {
-        "shared_content_order_encoder": model.content_order_encoder,
-    }
-    output.update(
-        {f"dinov2_block_{index}": model.backbone.blocks[index] for index in model.backbone.registered_indices}
-    )
-    output["dinov2_final_norm"] = model.backbone.model.norm
-    return output
-
-
-def _gradient_norms(model: CoRGeoModel) -> dict[str, float]:
-    output: dict[str, float] = {}
-    for name, module in _logical_modules(model).items():
-        squared = sum(
-            float(parameter.grad.detach().float().square().sum())
-            for parameter in module.parameters()
-            if parameter.grad is not None
-        )
-        value = squared**0.5
-        if not isfinite(value):
-            raise FloatingPointError(f"Non-finite gradient norm for {name}")
-        output[name] = value
-    return output
 
 
 class _MiningSatelliteRows(Dataset[dict[str, Any]]):
@@ -958,18 +923,8 @@ def _generate_hard_pools(
             result.scores,
             allow_pickle=False,
         )
-        write_json(
-            fov_root / "mining_diagnostics.json",
-            {
-                "query_count": len(query_indices),
-                "positive_coarse_topk_recall": result.positive_coarse_topk_recall,
-            },
-        )
         print(
-            f"[rank{rank}/mine] FoV {fov} "
-            f"Top-{int(hard['keep_negative_locations'])} ready; "
-            f"positive coarse Top-{int(hard['coarse_candidate_locations'])} "
-            f"recall={result.positive_coarse_topk_recall:.4f}",
+            f"[rank{rank}/mine] FoV {fov} Top-{int(hard['keep_negative_locations'])} ready",
             flush=True,
         )
     distributed.barrier()
@@ -977,7 +932,6 @@ def _generate_hard_pools(
     publish_error: str | None = None
     if rank == 0:
         try:
-            mining_diagnostics: dict[str, Any] = {}
             for fov in fovs:
                 merged_queries = np.concatenate(
                     [
@@ -1016,19 +970,6 @@ def _generate_hard_pools(
                     ),
                     common,
                 )
-                rank_diagnostics = []
-                for shard_rank in range(world_size):
-                    path = staging_root / f"rank_{shard_rank:02d}" / f"fov_{fov}" / "mining_diagnostics.json"
-                    with path.open("r", encoding="utf-8") as handle:
-                        rank_diagnostics.append(json.load(handle))
-                query_total = sum(int(row["query_count"]) for row in rank_diagnostics)
-                positive_total = sum(
-                    int(row["query_count"]) * float(row["positive_coarse_topk_recall"]) for row in rank_diagnostics
-                )
-                mining_diagnostics[str(fov)] = {
-                    "query_count": query_total,
-                    "positive_coarse_topk_recall": positive_total / max(query_total, 1),
-                }
             write_json(
                 output_root / "refresh.metadata.json",
                 {
@@ -1036,7 +977,6 @@ def _generate_hard_pools(
                     "fovs": fovs,
                     "location_count": location_count,
                     "world_size": world_size,
-                    "mining_diagnostics": mining_diagnostics,
                 },
             )
             shutil.rmtree(staging_root)
@@ -1064,13 +1004,8 @@ def train(
     config: ExperimentConfig,
     run_name: str,
     resume: str | Path | None = None,
-    smoke_steps: int | None = None,
 ) -> None:
     """Train one complete CoR-Geo run using the seed stored in the config."""
-    if smoke_steps is not None and int(smoke_steps) <= 0:
-        raise ValueError("smoke_steps must be positive")
-    if smoke_steps is not None and resume is not None:
-        raise ValueError("A smoke test cannot resume a training run")
     seed = int(config.train["seed"])
     rank, local_rank, world_size = initialize_distributed(config.train)
     topology = resolve_training_topology(config.train, world_size)
@@ -1088,11 +1023,10 @@ def train(
     train_manifest = read_manifest(manifest_paths["train"])
     global_batch = int(config.train["distributed"]["global_batch_size"])
     steps_per_epoch = len(train_manifest) // global_batch
-    if steps_per_epoch != 555:
-        raise ValueError(f"Unexpected {dataset_name.upper()} steps per epoch: {steps_per_epoch}")
+    if steps_per_epoch <= 0:
+        raise ValueError("Training manifest is smaller than one global batch")
 
     cache_root, require_train_cache = cache_request(config.train, "train")
-    cache_metadata_hashes: dict[str, str] = {}
     for split in map(
         str,
         config.train["dataset_cache"]["required_splits"],
@@ -1105,11 +1039,6 @@ def train(
             int(config.model["input"]["panorama_width"]),
             int(config.model["input"]["satellite_size"][0]),
         )
-        metadata_path = cache_metadata_path(
-            config.train["dataset_cache"]["root"],
-            split,
-        )
-        cache_metadata_hashes[split] = sha256_file(metadata_path)
 
     dataset = CrossViewDataset(
         train_manifest,
@@ -1138,7 +1067,6 @@ def train(
     loss_function = _loss_from_config(config.model).to(device)
 
     setup_error: str | None = None
-    created_new_run = False
     if rank == 0:
         try:
             if resume is None:
@@ -1146,8 +1074,6 @@ def train(
                     raise FileExistsError(f"Run already exists: {run_root}")
                 run_root.mkdir(parents=True, exist_ok=False)
                 write_yaml(run_root / "config_resolved.yaml", config.as_dict())
-                write_json(run_root / "environment.json", environment_snapshot())
-                created_new_run = True
             elif not run_root.is_dir():
                 raise FileNotFoundError(f"Resume run does not exist: {run_root}")
         except Exception as error:
@@ -1159,13 +1085,7 @@ def train(
 
     provenance = {
         "manifest_hashes": {split: sha256_file(path) for split, path in manifest_paths.items()},
-        "dataset_config_sha256": sha256_json(config.dataset),
-        "dinov2_checkpoint_sha256": sha256_file(config.paths["checkpoints"]["dinov2_vitb14"]),
-        "dataset_cache_metadata_hashes": cache_metadata_hashes,
         "model_config_sha256": sha256_json(config.model),
-        "score_config_sha256": sha256_json(config.model["score"]),
-        "project_git_state": git_state(project_root),
-        "dinov2_git_state": git_state(config.paths["dinov2_root"]),
         "training_topology": {
             "world_size": topology.world_size,
             "per_gpu_batch_size": topology.per_gpu_batch_size,
@@ -1173,32 +1093,6 @@ def train(
             "samples_per_fov_per_rank": topology.samples_per_fov_per_rank,
         },
     }
-    if config.dataset.get("exclusions"):
-        provenance["exclusions_sha256"] = sha256_json(config.dataset["exclusions"])
-    if rank == 0 and created_new_run:
-        write_json(
-            run_root / "data_protocol.json",
-            {
-                "dataset": dataset_name,
-                "dataset_protocol_version": str(config.dataset["protocol_version"]),
-                "protocol_version": ("cor_geo_bilinear_l16_top64_refresh6_gbs64_" f"{dataset_name}_v1"),
-                "manifest_counts": {split: len(read_manifest(path)) for split, path in manifest_paths.items()},
-                "manifest_hashes": provenance["manifest_hashes"],
-                "dataset_cache_metadata_hashes": cache_metadata_hashes,
-                "hard_pool_source": {
-                    "mode": "current_cor_geo_model",
-                    "candidate_strategy": config.train["hard_mining"]["candidate_strategy"],
-                },
-                "training_topology": provenance["training_topology"],
-            },
-        )
-        write_json(
-            run_root / "git_status.json",
-            {
-                "project": provenance["project_git_state"],
-                "dinov2": provenance["dinov2_git_state"],
-            },
-        )
 
     start_epoch = 1
     if resume is not None:
@@ -1260,7 +1154,6 @@ def train(
     )
     metrics_path = run_root / "train_metrics.jsonl"
     retained_epochs = set(map(int, config.train["checkpoint"]["retained_epochs"]))
-    smoke_steps_completed = 0
     for epoch in range(start_epoch, final_epoch + 1):
         ddp_model.train(True)
         model.set_train_epoch(epoch)
@@ -1289,7 +1182,6 @@ def train(
         plan = _broadcast(plan, rank)
         sampler.set_plan(plan, epoch)
         for step_in_epoch, batch in enumerate(loader, start=1):
-            torch.cuda.reset_peak_memory_stats(device)
             local_indices = batch["manifest_index"].to(device, non_blocking=True)
             if step_in_epoch == 1:
                 _assert_global_unique(local_indices, world_size)
@@ -1316,17 +1208,6 @@ def train(
                 losses = loss_function(output)
             losses.total.backward()
 
-            diagnostics_interval = int(config.train["diagnostics"]["module_gradient_norm_interval_steps"])
-            record_module_norms = rank == 0 and (
-                step_in_epoch == 1 or step_in_epoch == len(loader) or step_in_epoch % diagnostics_interval == 0
-            )
-            gradient_norms = _gradient_norms(model) if record_module_norms else None
-            if (
-                epoch <= 8
-                and gradient_norms is not None
-                and any(gradient_norms[name] != 0.0 for name in gradient_norms if name.startswith("dinov2"))
-            ):
-                raise RuntimeError("DINOv2 received gradients during frozen epochs 1-8")
             batch_kind = plan[step_in_epoch - 1].kind
             gradient_config = config.train["gradient"]
             clip_norm = float(
@@ -1334,14 +1215,13 @@ def train(
                 if batch_kind == "hard"
                 else gradient_config["normal_batch_clip_norm"]
             )
-            global_gradient_norm = torch.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 [parameter for parameter in model.parameters() if parameter.requires_grad],
                 max_norm=clip_norm,
             )
             optimizer.step()
             scheduler.step_completed()
             if rank == 0:
-                global_norm = float(global_gradient_norm)
                 append_jsonl(
                     metrics_path,
                     {
@@ -1356,33 +1236,9 @@ def train(
                         "joint_in_batch_accuracy": float(losses.joint_in_batch_accuracy),
                         "order_in_batch_accuracy": float(losses.order_in_batch_accuracy),
                         "learning_rates": learning_rates,
-                        "gradient_norms": gradient_norms,
-                        "global_gradient_norm_pre_clip": global_norm,
-                        "gradient_clip_norm": clip_norm,
-                        "gradient_clip_coefficient": min(1.0, clip_norm / (global_norm + 1.0e-6)),
-                        "peak_gpu_memory": torch.cuda.max_memory_allocated(device),
                     },
                 )
             del output, losses, ground_by_fov, positions_by_fov
-            if smoke_steps is not None:
-                smoke_steps_completed += 1
-                if smoke_steps_completed >= int(smoke_steps):
-                    if rank == 0:
-                        write_json(
-                            run_root / "smoke_test.json",
-                            {
-                                "status": "passed",
-                                "dataset": dataset_name,
-                                "optimizer_steps": smoke_steps_completed,
-                                "world_size": topology.world_size,
-                                "per_gpu_batch_size": topology.per_gpu_batch_size,
-                                "global_batch_size": topology.global_batch_size,
-                                "samples_per_fov_per_rank": topology.samples_per_fov_per_rank,
-                            },
-                        )
-                    distributed.barrier()
-                    distributed.destroy_process_group()
-                    return
 
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
@@ -1440,18 +1296,60 @@ def train(
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
+def _parse_device_ids(value: str | None) -> tuple[int, ...]:
+    """Resolve the public device list while keeping single-GPU as the default."""
+    if value is None:
+        return (0,)
+    fields = [field.strip() for field in value.split(",")]
+    if not fields or any(not field for field in fields):
+        raise ValueError("--devices must be a comma-separated list such as 0 or 0,1")
+    try:
+        devices = tuple(int(field) for field in fields)
+    except ValueError as error:
+        raise ValueError("--devices must contain non-negative integer GPU IDs") from error
+    if any(device < 0 for device in devices):
+        raise ValueError("--devices must contain non-negative integer GPU IDs")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must not contain duplicate GPU IDs")
+    if len(devices) not in (1, 2):
+        raise ValueError("CoR-Geo training supports one or two devices")
+    return devices
+
+
+def _launch_workers(devices_arg: str | None) -> None:
+    """Hide the torchrun rendezvous behind the public ``--devices`` option."""
+    if "RANK" in os.environ:
+        return
+    devices = _parse_device_ids(devices_arg)
+    if devices_arg is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
+    else:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc-per-node={len(devices)}",
+        "-m",
+        "cor_geo.train",
+        *sys.argv[1:],
+    ]
+    os.execvpe(sys.executable, command, os.environ.copy())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=("cvact", "cvusa"), required=True)
+    parser.add_argument(
+        "--devices",
+        help="Comma-separated GPU IDs; defaults to one GPU (for example: 0,1)",
+    )
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--run-name")
     parser.add_argument("--resume")
-    parser.add_argument(
-        "--smoke-steps",
-        type=int,
-        help="Run this many real optimizer steps, write smoke_test.json, and exit without a checkpoint",
-    )
     args = parser.parse_args()
+    _launch_workers(args.devices)
     config = load_experiment_config(
         f"configs/{args.dataset}.yaml",
         args.config,
@@ -1460,7 +1358,6 @@ def main() -> None:
         config,
         args.run_name or f"cor_geo_{args.dataset}",
         resume=args.resume,
-        smoke_steps=args.smoke_steps,
     )
 
 

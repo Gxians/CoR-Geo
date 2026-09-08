@@ -28,8 +28,6 @@ from cor_geo.model import CoRGeoModel
 from cor_geo.train import load_checkpoint
 from cor_geo.utils import configure_deterministic_algorithms, load_yaml, sha256_file, sha256_json, write_json
 
-# ---- src/cor_geo/metrics/retrieval.py ----
-
 """Location-level Recall definitions."""
 
 
@@ -57,8 +55,6 @@ def retrieval_metrics(
     output["R@1%_threshold_ceil"] = int(one_percent_ceil)
     return output
 
-
-# ---- src/cor_geo/engine/fov_generalization.py ----
 
 """Parameter-free geometry for evaluation at unseen fields of view."""
 
@@ -161,8 +157,6 @@ def register_evaluation_resamplers(
         resampler.eval()
         model.ground_angular_resamplers[key] = resampler
 
-
-# ---- src/cor_geo/engine/retrieval_evaluator.py ----
 
 """Efficient descriptor export and exact cyclic Hard-Max evaluation."""
 
@@ -538,9 +532,6 @@ def exact_evaluate_shard(
     query_chunk_size: int,
     location_chunk_size: int,
     score_config: dict[str, Any],
-    checkpoint_sha256: str,
-    manifest_sha256: str,
-    crop_schedule_sha256: str,
     split: str = "val",
     dataset_name: str = "cvact",
     progress_label: str | None = None,
@@ -675,9 +666,6 @@ def exact_evaluate_shard(
                     "positive_score": float(positive_score_values[local_index]),
                     "best_shift_id": int(best_shift_values[local_index]),
                     "positive_best_shift_id": int(positive_shift_values[local_index]),
-                    "checkpoint_sha256": checkpoint_sha256,
-                    "manifest_sha256": manifest_sha256,
-                    "random_crop_schedule_sha256": crop_schedule_sha256,
                 }
             )
         if progress_label:
@@ -695,8 +683,6 @@ def exact_evaluate_shard(
     )
     return pd.DataFrame(rows), metrics
 
-
-# ---- src/cor_geo/evaluation_protocol.py ----
 
 """Auditable random-crop schedules for public evaluation."""
 
@@ -1238,9 +1224,6 @@ def main() -> None:
                 query_chunk_size=int(exact["query_chunk_size"]),
                 location_chunk_size=int(exact["location_chunk_size"]),
                 score_config=score_config,
-                checkpoint_sha256=checkpoint_hash,
-                manifest_sha256=manifest_hash,
-                crop_schedule_sha256=crop_hash,
                 split=split,
                 dataset_name=dataset_name,
                 progress_label=f"rank{rank}/fov{fov}",
@@ -1266,7 +1249,6 @@ def main() -> None:
                     "split": split,
                     "crop_mode": "random",
                     "manifest_sha256": manifest_hash,
-                    "random_crop_schedule_sha256": crop_hash,
                     "location_score": model_config["score"]["name"],
                     "shift_reduction": model_config["score"]["shift_reduction"],
                     "direction_representation": "content_attention_plus_first_cosine_order",

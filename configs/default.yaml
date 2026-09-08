@@ -126,8 +126,6 @@ train:
     - val
     format: cor_geo_paired_resized_rgb_uint8_memmap_v1
     root: .cache/cor_geo/{dataset}/h224_w756_s378_v1
-  diagnostics:
-    module_gradient_norm_interval_steps: 50
   mixed_fov_batch:
     fovs:
     - 360

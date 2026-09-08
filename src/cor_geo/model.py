@@ -11,8 +11,6 @@ from torch import Tensor, nn
 
 from cor_geo.content_order import BilinearSquareRaySampler, ConservativeAngularResampler, ContentOrderEncoder
 
-# ---- src/cor_geo/models/dinov2_wrapper.py ----
-
 """Shared DINOv2-B/14 wrapper with delayed final-block fine-tuning."""
 
 
@@ -200,8 +198,6 @@ class DINOv2Backbone(nn.Module):
             width=width,
         )
 
-
-# ---- src/cor_geo/models/cor_geo_model.py ----
 
 """Content--Order direction model used by CoR-Geo."""
 

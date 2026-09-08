@@ -22,7 +22,14 @@ from cor_geo.datasets import (
 )
 from cor_geo.evaluate import retrieval_metrics
 from cor_geo.samplers import PlannedRankBatchSampler, build_epoch_plan
-from cor_geo.utils import ConfigError, load_experiment_config, load_yaml, resolve_training_topology
+from cor_geo.train import _parse_device_ids
+from cor_geo.utils import (
+    ConfigError,
+    load_experiment_config,
+    load_yaml,
+    resolve_training_topology,
+    validate_experiment_config,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,6 +45,17 @@ def test_public_configuration_is_valid_and_portable(dataset: str) -> None:
     assert all(not Path(value).is_absolute() for value in paths["datasets"].values())
 
 
+def test_validation_accepts_structurally_valid_experiment_variants() -> None:
+    config = load_experiment_config(ROOT / "configs" / "cvact.yaml", ROOT / "configs" / "default.yaml")
+    config.model["architecture"]["content_order_encoder"]["joint_order_weight"] = 0.25
+    config.model["loss"]["label_smoothing"] = 0.05
+    hard = config.train["hard_mining"]
+    hard["coarse_candidate_locations"] = 256
+    hard["keep_negative_locations"] = 32
+    hard["sampling_rank_range"] = [1, 32]
+    validate_experiment_config(config)
+
+
 def test_one_and_two_gpu_topologies_preserve_the_global_protocol() -> None:
     train = load_yaml(ROOT / "configs" / "default.yaml")["train"]
     one = resolve_training_topology(train, 1)
@@ -46,6 +64,16 @@ def test_one_and_two_gpu_topologies_preserve_the_global_protocol() -> None:
     assert (two.per_gpu_batch_size, two.global_batch_size, two.samples_per_fov_per_rank) == (32, 64, 8)
     with pytest.raises(ConfigError, match="one or two GPUs"):
         resolve_training_topology(train, 4)
+
+
+def test_public_device_option_defaults_to_one_gpu_and_accepts_two() -> None:
+    assert _parse_device_ids(None) == (0,)
+    assert _parse_device_ids("0") == (0,)
+    assert _parse_device_ids("0,1") == (0, 1)
+    assert _parse_device_ids(" 2, 3 ") == (2, 3)
+    for invalid in ("", "0,", "-1", "0,0", "0,1,2", "gpu0"):
+        with pytest.raises(ValueError):
+            _parse_device_ids(invalid)
 
 
 def test_one_gpu_batch_matches_the_two_contiguous_rank_shards() -> None:

@@ -9,8 +9,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
-# ---- src/cor_geo/models/content_order_encoder.py ----
-
 """Content-and-order per-direction encoding without discrete radial slots."""
 
 

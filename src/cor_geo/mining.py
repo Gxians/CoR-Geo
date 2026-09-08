@@ -18,8 +18,6 @@ from torch.nn import functional
 from cor_geo.matching import cyclic_hard_max_score
 from cor_geo.utils import write_json
 
-# ---- src/cor_geo/mining/hard_pool.py ----
-
 """Atomic persistence for compact ranked hard-negative pools."""
 
 
@@ -110,8 +108,6 @@ def load_compact_hard_pool(
     return indices
 
 
-# ---- src/cor_geo/mining/hard_negative_mining.py ----
-
 """Self-contained coarse-to-exact hard-negative mining for CoR-Geo.
 
 The coarse signature keeps the signed DC component and magnitudes of the
@@ -153,7 +149,6 @@ def rotation_invariant_fft_signature(
 class MiningResult:
     indices: np.ndarray
     scores: np.ndarray
-    positive_coarse_topk_recall: float
 
 
 class HardNegativeCandidateBank:
@@ -219,8 +214,6 @@ class HardNegativeCandidateBank:
 
         output_indices = np.empty((len(directions), int(final_keep)), dtype=np.int32)
         output_scores = np.empty((len(directions), int(final_keep)), dtype=np.float32)
-        positive_covered = 0
-
         for search_start in range(0, len(directions), int(search_chunk_size)):
             search_stop = min(search_start + int(search_chunk_size), len(directions))
             query = torch.as_tensor(
@@ -245,18 +238,14 @@ class HardNegativeCandidateBank:
                 device=self.device,
             )
             rows = torch.arange(search_stop - search_start, device=self.device)
-            positive_scores = coarse_scores[rows, positive_columns].clone()
             coarse_scores[rows, positive_columns] = float("-inf")
-            coarse_values, coarse_indices = torch.topk(
+            _, coarse_indices = torch.topk(
                 coarse_scores,
                 k=int(coarse_keep),
                 dim=1,
                 sorted=True,
             )
-            # Free cross-view compatibility diagnostic: whether the true pair
-            # would survive the same coarse Top-K screen before exclusion.
-            positive_covered += int((positive_scores >= coarse_values[:, -1]).sum().item())
-            del coarse_scores, query_signature, positive_scores, coarse_values
+            del coarse_scores, query_signature
 
             for local_start in range(0, len(query), int(rerank_chunk_size)):
                 local_stop = min(local_start + int(rerank_chunk_size), len(query))
@@ -295,5 +284,4 @@ class HardNegativeCandidateBank:
         return MiningResult(
             indices=output_indices,
             scores=output_scores,
-            positive_coarse_topk_recall=(float(positive_covered) / max(len(directions), 1)),
         )

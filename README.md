@@ -49,40 +49,25 @@ caches in `.cache/cor_geo/`, and experiments in `outputs/`.
 ## Training
 
 Training keeps the reported global batch size of 64 under both supported
-topologies. `torchrun` automatically selects 32 samples per GPU with two GPUs
-or 64 samples with one GPU; learning rates and all global FoV quotas remain
-unchanged. The two executions implement the same batch protocol, although
-floating-point reduction order means that their checkpoints are not expected
-to be bitwise identical. Resume a run with the same GPU count that created it.
+topologies. Single-GPU training is the default; `--devices 0,1` selects the
+reported two-GPU topology. The launcher automatically uses 64 samples on one
+GPU or 32 per GPU on two GPUs, while learning rates and global FoV quotas remain
+unchanged. The executions implement the same batch protocol, although floating-
+point reduction order means their checkpoints are not expected to be bitwise
+identical. Resume a run with the same GPU count that created it.
 
 ```bash
-# Reported two-GPU topology: 2 x 32 = 64
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m cor_geo.train --dataset cvact
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m cor_geo.train --dataset cvusa
+# Single GPU (default): 1 x 64 = 64
+python -m cor_geo.train --dataset cvact
+python -m cor_geo.train --dataset cvusa
 
-# Equivalent one-GPU topology: 1 x 64 = 64
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m cor_geo.train --dataset cvact
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m cor_geo.train --dataset cvusa
+# Two GPUs (paper setting): 2 x 32 = 64
+python -m cor_geo.train --dataset cvact --devices 0,1
+python -m cor_geo.train --dataset cvusa --devices 0,1
 ```
 
 Use `--run-name` to select another output directory and `--resume` to continue
 from a checkpoint.
-
-After preparing manifests and caches, exercise the real data, DINOv2,
-distributed loss, back-propagation, and optimizer path for two steps. Smoke
-runs intentionally do not publish a training checkpoint.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  -m cor_geo.train --dataset cvact --run-name smoke_cvact_2gpu --smoke-steps 2
-
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 \
-  -m cor_geo.train --dataset cvact --run-name smoke_cvact_1gpu --smoke-steps 2
-```
-
-A successful run writes `outputs/cvact/<run-name>/smoke_test.json`. Use a new
-run name for every smoke test. Replace `cvact` with `cvusa` in the same commands
-to validate the CVUSA input pipeline.
 
 ## Evaluation
 

@@ -26,8 +26,6 @@ from torchvision.transforms import functional as vision
 
 from cor_geo.utils import load_yaml, resolve_project_path, sha256_file, sha256_json, stable_seed, write_json
 
-# ---- src/cor_geo/datasets/panorama_crop.py ----
-
 """Deterministic orientation generation and circular panorama cropping."""
 
 
@@ -161,8 +159,6 @@ def circular_crop(image: Image.Image, center_px: int, width: int) -> Image.Image
     output.paste(second, (first.width, 0))
     return output
 
-
-# ---- src/cor_geo/datasets/transforms.py ----
 
 """Deterministic image transformations with operation-specific seeds."""
 
@@ -349,8 +345,6 @@ class SatelliteTransform:
         return _normalize(image)
 
 
-# ---- src/cor_geo/datasets/resized_cache.py ----
-
 """Deterministic uint8 RGB memmaps for paired panorama datasets."""
 
 
@@ -399,10 +393,6 @@ def cache_request(
     root = Path(str(config["root"])).expanduser().resolve()
     required = str(split) in set(map(str, config.get("required_splits", [])))
     return root, required
-
-
-def cache_metadata_path(root: str | Path, split: str) -> Path:
-    return Path(root).expanduser().resolve() / str(split) / "metadata.json"
 
 
 class _ResizeRows(Dataset[dict[str, Any]]):
@@ -739,8 +729,6 @@ def build_resized_cache(
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
-
-# ---- src/cor_geo/datasets/manifests.py ----
 
 """CVACT/CVUSA annotation parsing, immutable manifests, and strict audits."""
 
@@ -1238,8 +1226,6 @@ def load_manifest_metadata(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"Invalid manifest metadata: {resolved}")
     return value
 
-
-# ---- src/cor_geo/datasets/cross_view.py ----
 
 """PyTorch dataset backed by immutable CVACT or CVUSA pair manifests."""
 
