@@ -1,165 +1,131 @@
 # CoR-Geo
 
-Research implementation of **CoR-Geo: Weakly Ordered Directional
+Official implementation of **CoR-Geo: Weakly Ordered Directional
 Representation for Limited-FoV Cross-View Geo-Localization**.
 
-**Paper:** Preprint in preparation
+> Paper and pretrained checkpoints will be released with the preprint.
 
-CoR-Geo represents ground-view directions as bottom-to-top patch columns and
-satellite-view directions as center-to-boundary rays. A shared Content--Order
-encoder produces direction descriptors, while FoV-masked cyclic matching
-searches over the unknown relative heading. One model and one pre-encoded
-satellite gallery support multiple FoVs without heading supervision.
+CoR-Geo represents a ground view with bottom-to-top columns and a satellite
+view with center-to-boundary rays. A shared Content--Order encoder preserves
+directional evidence, while FoV-masked cyclic matching handles unknown
+headings. One model and one pre-encoded satellite gallery support multiple
+fields of view without heading supervision.
 
-![CoR-Geo architecture](docs/figures/cor_geo_architecture.png)
+<p align="center">
+  <img src="assets/architecture.png" width="100%" alt="CoR-Geo architecture">
+</p>
 
 ## Installation
 
-The reported experiments used Python 3.10, PyTorch 2.3.1, CUDA 12.1, and two
-NVIDIA RTX 4090 GPUs.
+The experiments use Python 3.10, PyTorch 2.3.1, CUDA 12.1, and DINOv2-B/14.
 
 ```bash
-conda env create -f environment.yml
+conda create -n cor_geo python=3.10 -y
 conda activate cor_geo
-python -m pip install -e .
-```
+pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -e .
 
-Install the pinned DINOv2 backbone:
-
-```bash
 mkdir -p third_party checkpoints/dinov2
 git clone https://github.com/facebookresearch/dinov2.git third_party/dinov2
 git -C third_party/dinov2 checkout 7764ea0f912e53c92e82eb78a2a1631e92725fc8
-curl -L \
-  https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth \
-  -o checkpoints/dinov2/dinov2_vitb14_pretrain.pth
+wget -O checkpoints/dinov2/dinov2_vitb14_pretrain.pth \
+  https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth
 ```
 
-Expected SHA-256 for `dinov2_vitb14_pretrain.pth`:
+## Data
 
-```text
-0b8b82f85de91b424aded121c7e1dcc2b7bc6d0adeea651bf73a13307fad8c73
-```
+Request CVACT and CVUSA from their providers, then place them directly under
+`data/`. The expected directory layout and split sizes are listed in
+[`data/README.md`](data/README.md). Prepare manifests and resized caches with:
 
 ```bash
-python tools/verify_dinov2.py \
-  --model-config configs/model.yaml \
-  --paths configs/paths.yaml
+python -m cor_geo.datasets --dataset cvact
+python -m cor_geo.datasets --dataset cvusa
 ```
 
-## Data preparation
-
-Download CVACT and CVUSA from their official providers and place them under
-`data/`. The complete layout, expected split sizes, access terms, and integrity
-commands are documented in [`data/README.md`](data/README.md).
-Dataset files are not distributed by this repository.
-
-```bash
-python tools/prepare_cvact_manifests.py --dataset-config configs/cvact.yaml
-python tools/verify_cvact_manifests.py --dataset-config configs/cvact.yaml
-
-python tools/prepare_cvusa_manifests.py
-python tools/verify_cvusa_manifests.py
-```
-
-## Pretrained models
-
-Evaluation-ready checkpoints will be released after the cleaned checkpoint
-bundles pass end-to-end validation.
-
-| Training set | Download | SHA-256 |
-|---|---|---|
-| CVACT | To be released | -- |
-| CVUSA | To be released | -- |
-
-Each downloadable bundle should contain `config_resolved.yaml` and
-`checkpoints/epoch_064.ckpt` in this layout:
-
-```text
-outputs/
-├── cvact/cor_geo_cvact/
-│   ├── config_resolved.yaml
-│   └── checkpoints/epoch_064.ckpt
-└── cvusa/cor_geo_cvusa/
-    ├── config_resolved.yaml
-    └── checkpoints/epoch_064.ckpt
-```
+All default paths are repository-relative: datasets are stored in `data/`,
+caches in `.cache/cor_geo/`, and experiments in `outputs/`.
 
 ## Training
 
-The launcher builds the resized cache and runs the configured 64-epoch,
-two-GPU protocol:
+Training keeps the reported global batch size of 64 under both supported
+topologies. `torchrun` automatically selects 32 samples per GPU with two GPUs
+or 64 samples with one GPU; learning rates and all global FoV quotas remain
+unchanged. The two executions implement the same batch protocol, although
+floating-point reduction order means that their checkpoints are not expected
+to be bitwise identical. Resume a run with the same GPU count that created it.
 
 ```bash
-bash scripts/train.sh cvact
-bash scripts/train.sh cvusa
+# Reported two-GPU topology: 2 x 32 = 64
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m cor_geo.train --dataset cvact
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m cor_geo.train --dataset cvusa
+
+# Equivalent one-GPU topology: 1 x 64 = 64
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m cor_geo.train --dataset cvact
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m cor_geo.train --dataset cvusa
 ```
 
-Data remain under `data/`, resized caches under `.cache/cor_geo/`, and run
-artifacts under `outputs/`. All paths are repository-relative and excluded from
-Git.
+Use `--run-name` to select another output directory and `--resume` to continue
+from a checkpoint.
+
+After preparing manifests and caches, exercise the real data, DINOv2,
+distributed loss, back-propagation, and optimizer path for two steps. Smoke
+runs intentionally do not publish a training checkpoint.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  -m cor_geo.train --dataset cvact --run-name smoke_cvact_2gpu --smoke-steps 2
+
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 \
+  -m cor_geo.train --dataset cvact --run-name smoke_cvact_1gpu --smoke-steps 2
+```
+
+A successful run writes `outputs/cvact/<run-name>/smoke_test.json`. Use a new
+run name for every smoke test. Replace `cvact` with `cvusa` in the same commands
+to validate the CVUSA input pipeline.
 
 ## Evaluation
 
-Evaluate with independently randomized query headings:
+Evaluation supports one or more GPUs and draws an independent random heading
+for every query--FoV pair. The sampled schedule is saved with the results.
 
 ```bash
-bash scripts/evaluate.sh cvact val epoch_064
-bash scripts/evaluate.sh cvusa val epoch_064
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m cor_geo.evaluate \
+  --run-dir outputs/cvact/cor_geo_cvact \
+  --checkpoint epoch_064
 ```
 
-`COR_GEO_GPUS` controls the visible GPUs; evaluation uses the same number of
-processes. For single-GPU evaluation:
+Pass `--crop-schedule <file.parquet>` to replay a recorded draw. To evaluate
+additional FoVs, use `--fovs ... --allow-unseen-fovs`.
 
-```bash
-COR_GEO_GPUS=0 bash scripts/evaluate.sh cvact val epoch_064
-```
+## Results
 
-Every run stores its sampled query--FoV angles and hash. Replay a retained
-schedule exactly with:
+Validation Macro R@1 over 360°, 180°, 90°, and 70° random crops:
 
-```bash
-COR_GEO_CROP_SCHEDULE=/path/to/random_crop_schedule.parquet \
-bash scripts/evaluate.sh cvact val epoch_064
-```
+| Dataset | Macro R@1 |
+|:--|--:|
+| CVACT | 75.4 |
+| CVUSA | 79.8 |
 
-The evaluator uses one satellite bank for all FoVs and reports R@1, R@5,
-R@10, and R@1%.
-
-## Reported validation results
-
-Macro R@1 is the mean R@1 over 360°, 180°, 90°, and 70° queries.
-
-| Dataset | 360° | 180° | 90° | 70° | Macro R@1 |
-|---|---:|---:|---:|---:|---:|
-| CVACT | 89.7 | 84.6 | 69.0 | 58.2 | 75.4 |
-| CVUSA | 95.0 | 90.0 | 72.2 | 61.9 | 79.8 |
-
-These are validation results from one checkpoint and one recorded random-crop
-draw, not averages over repeated evaluations.
+These values come from one trained checkpoint and one recorded random-crop
+evaluation. Download links will be added after the checkpoint release.
 
 ## Tests
 
+The unit tests require neither datasets nor pretrained weights.
+
 ```bash
-ruff check .
+pip install -e ".[dev]"
+ruff check src tests
 pytest -q
 ```
 
-The unit tests do not require datasets or pretrained weights.
-
 ## Citation
 
-Machine-readable software metadata are provided in
-[`CITATION.cff`](CITATION.cff). The paper citation will be added when the
-preprint is publicly available.
+The BibTeX entry will be added when the preprint is available.
 
-## License and acknowledgements
+## License
 
-CoR-Geo source code is released under the [MIT License](LICENSE). The code in
-this repository was implemented independently and does not copy or adapt source
-files from another research repository. It uses
-[DINOv2](https://github.com/facebookresearch/dinov2) as an external backbone
-dependency, pinned to commit `7764ea0f912e53c92e82eb78a2a1631e92725fc8`.
-DINOv2 and its pretrained weights remain subject to their upstream terms and
-are not redistributed here. CVACT and CVUSA likewise remain subject to their
-providers' terms.
+The source code is released under the [MIT License](LICENSE). CoR-Geo uses
+[DINOv2](https://github.com/facebookresearch/dinov2) as an external dependency;
+its code and pretrained weights remain subject to the upstream license.

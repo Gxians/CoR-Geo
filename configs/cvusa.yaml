@@ -13,7 +13,7 @@ splits:
     expected_count: 8884
 
 # PIL reports sizes as [width, height].  The two modalities intentionally have
-# different native resolutions; preprocessing maps both datasets through model.yaml.
+# different native resolutions; preprocessing is shared through default.yaml.
 expected_source_image_sizes:
   query: [1232, 224]
   satellite: [750, 750]

@@ -1,15 +1,10 @@
-# Dataset placement
+# Data preparation
 
-Download the datasets from their official providers and extract them directly
-under this directory. The default configuration expects the following layout:
+CoR-Geo does not redistribute CVACT or CVUSA. Request each dataset from its
+provider and extract it into this directory:
 
-| Dataset | Official access and terms | Paper citation |
-|---|---|---|
-| CVACT | [ACT dataset instructions](https://github.com/Liumouliu/OriCNN#act-dataset); request access from the dataset author and do not redistribute the data | Liu and Li, *Lending Orientation to Neural Networks for Cross-View Geo-Localization*, CVPR 2019 |
-| CVUSA | [MVRL CVUSA request page](https://mvrl.cse.wustl.edu/datasets/cvusa/) | Zhai et al., *Predicting Ground-Level Scene Layout from Aerial Imagery*, CVPR 2017 |
-
-CoR-Geo does not redistribute either dataset. Access, use, and redistribution
-remain governed by the respective providers.
+- [CVACT access instructions](https://github.com/Liumouliu/OriCNN#act-dataset)
+- [CVUSA request page](https://mvrl.cse.wustl.edu/datasets/cvusa/)
 
 ```text
 data/
@@ -26,49 +21,34 @@ data/
     │   ├── train-19zl.csv
     │   └── val-19zl.csv
     ├── split_locations/
-    │   ├── all.csv
-    │   ├── train.csv
-    │   └── test.csv
     ├── streetview/
-    ├── bingmap/
-    │   └── 19/
+    │   ├── panos/
+    │   └── annotations/
+    └── bingmap/
+        ├── 18/                 # optional; not used by the 19zl protocol
+        ├── 19/                 # required satellite images
+        └── 20/                 # optional; not used by the 19zl protocol
 ```
 
-Dataset files are intentionally ignored by Git. Do not commit images,
-annotations, generated manifests, or caches.
+The official `19zl` split CSVs reference images under `streetview/panos/`,
+annotations under `streetview/annotations/`, and satellites under
+`bingmap/19/`. `split_locations/` is retained as part of the distributed
+dataset but is not read by the CoR-Geo training pipeline. The `bingmap/18/`
+and `bingmap/20/` image levels and downloaded archive files may remain in the
+dataset directory, but the default configuration neither scans nor caches
+them.
 
-## Expected protocol counts
+Expected paired records are 35,531/8,884/92,802 for CVACT
+train/validation/test and 35,532/8,884 for CVUSA train/validation. The single
+unavailable CVACT training pair is declared in `configs/cvact.yaml`.
 
-After manifest preparation and verification, the expected numbers of paired
-ground/satellite records are:
-
-| Dataset | Split | Annotated | Used by CoR-Geo |
-|---|---|---:|---:|
-| CVACT | train | 35,532 | 35,531 |
-| CVACT | validation | 8,884 | 8,884 |
-| CVACT | test | 92,802 | 92,802 |
-| CVUSA | train | 35,532 | 35,532 |
-| CVUSA | validation | 8,884 | 8,884 |
-
-The excluded CVACT training pair and its provenance are recorded in
-`../configs/cvact_exclusions.yaml`; it must not be silently deleted from the
-source annotations. CVUSA uses the official `19zl` split CSV row order.
-
-## Integrity verification
-
-From the repository root, run:
+From the repository root, build portable manifests and resized image caches:
 
 ```bash
-python tools/prepare_cvact_manifests.py \
-  --dataset-config configs/cvact.yaml
-python tools/verify_cvact_manifests.py \
-  --dataset-config configs/cvact.yaml
-
-python tools/prepare_cvusa_manifests.py
-python tools/verify_cvusa_manifests.py
+python -m cor_geo.datasets --dataset cvact
+python -m cor_geo.datasets --dataset cvusa
 ```
 
-Verification checks expected counts, one-to-one IDs, source file inventories,
-paths, dimensions, and manifest/provenance hashes. Generated manifests use
-repository-relative paths and remain valid when the complete repository is
-moved without changing the documented `data/` layout.
+Preparation verifies IDs, file inventories, image dimensions, and expected
+split sizes. Generated manifests use repository-relative paths, so the whole
+repository can be moved without editing configuration files.

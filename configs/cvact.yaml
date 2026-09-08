@@ -1,9 +1,11 @@
 dataset: cvact
 root_key: cvact
 protocol_version: cvact_v2.1
-manifest_splits: [train, val, test]
+manifest_splits:
+- train
+- val
+- test
 mat_file: ACT_data.mat
-
 splits:
   train:
     mat_struct: trainSet
@@ -23,16 +25,18 @@ splits:
     image_root: ANU_data_test
     expected_annotated_count: 92802
     expected_final_count: 92802
-
 path_patterns:
-  query: "{image_root}/streetview/{query_id}_grdView.jpg"
-  satellite: "{image_root}/satview_polish/{satellite_id}_satView_polish.jpg"
-
+  query: '{image_root}/streetview/{query_id}_grdView.jpg'
+  satellite: '{image_root}/satview_polish/{satellite_id}_satView_polish.jpg'
 id_contract:
   query_id_unique: true
   satellite_id_unique: true
   one_to_one: true
   query_id_equals_satellite_id: true
-
-exclusions_config: configs/cvact_exclusions.yaml
 strict_annotation_file_equality: true
+exclusions:
+- split: train
+  query_id: 1LqOHPdTiBbRucz-jFOSbQ
+  satellite_id: 1LqOHPdTiBbRucz-jFOSbQ
+  source_mat_index: 297431
+  reason: both_ground_and_satellite_files_missing_in_reference_data_snapshot
