@@ -1,15 +1,12 @@
 # CoR-Geo
 
-Official implementation of **CoR-Geo: Weakly Ordered Directional
-Representation for Limited-FoV Cross-View Geo-Localization**.
+Official implementation of **CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization**.
 
-> Paper and pretrained checkpoints will be released with the preprint.
+> The paper and pretrained models will be released with the preprint.
 
-CoR-Geo represents a ground view with bottom-to-top columns and a satellite
-view with center-to-boundary rays. A shared Content--Order encoder preserves
-directional evidence, while FoV-masked cyclic matching handles unknown
-headings. One model and one pre-encoded satellite gallery support multiple
-fields of view without heading supervision.
+## Introduction
+
+CoR-Geo addresses limited-FoV cross-view geo-localization under unknown relative headings. It organizes ground patch columns and satellite rays into direction-level weakly ordered representations, avoiding dense vertical--radial alignment. FoV-masked cyclic matching enables one model and one pre-encoded satellite gallery to support multiple FoVs without heading supervision.
 
 <p align="center">
   <img src="assets/architecture.png" width="100%" alt="CoR-Geo architecture">
@@ -17,100 +14,94 @@ fields of view without heading supervision.
 
 ## Installation
 
-The experiments use Python 3.10, PyTorch 2.3.1, CUDA 12.1, and DINOv2-B/14.
+The code has been tested with:
+
+- Linux
+- Python 3.10
+- PyTorch 2.3.1
+- CUDA 12.1
+
+Install CoR-Geo with:
 
 ```bash
+git clone https://github.com/Gxians/CoR-Geo.git
+cd CoR-Geo
+
 conda create -n cor_geo python=3.10 -y
 conda activate cor_geo
-pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
-pip install -e .
-
-mkdir -p third_party checkpoints/dinov2
-git clone https://github.com/facebookresearch/dinov2.git third_party/dinov2
-git -C third_party/dinov2 checkout 7764ea0f912e53c92e82eb78a2a1631e92725fc8
-wget -O checkpoints/dinov2/dinov2_vitb14_pretrain.pth \
-  https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth
+pip install -e . --no-build-isolation
 ```
 
-## Data
+### DINOv2 Backbone
 
-Request CVACT and CVUSA from their providers, then place them directly under
-`data/`. The expected directory layout and split sizes are listed in
-[`data/README.md`](data/README.md). Prepare manifests and resized caches with:
+Download the DINOv2 source code and ViT-B/14 pretrained weights:
+
+```bash
+bash scripts/setup_dinov2.sh
+```
+
+## Dataset Preparation
+
+Request CVACT and CVUSA from their respective providers and place them under `data/`. The expected directory structure and dataset access links are provided in [`data/README.md`](data/README.md).
+
+Build the manifests and resized-image caches with:
 
 ```bash
 python -m cor_geo.datasets --dataset cvact
 python -m cor_geo.datasets --dataset cvusa
 ```
 
-All default paths are repository-relative: datasets are stored in `data/`,
-caches in `.cache/cor_geo/`, and experiments in `outputs/`.
+## Usage
 
-## Training
+### Training
 
-Training keeps the reported global batch size of 64 under both supported
-topologies. Single-GPU training is the default; `--devices 0,1` selects the
-reported two-GPU topology. The launcher automatically uses 64 samples on one
-GPU or 32 per GPU on two GPUs, while learning rates and global FoV quotas remain
-unchanged. The executions implement the same batch protocol, although floating-
-point reduction order means their checkpoints are not expected to be bitwise
-identical. Resume a run with the same GPU count that created it.
+Train on CVACT or CVUSA using one GPU:
 
 ```bash
-# Single GPU (default): 1 x 64 = 64
 python -m cor_geo.train --dataset cvact
 python -m cor_geo.train --dataset cvusa
+```
 
-# Two GPUs (paper setting): 2 x 32 = 64
+Use two GPUs for the setting reported in the paper:
+
+```bash
 python -m cor_geo.train --dataset cvact --devices 0,1
 python -m cor_geo.train --dataset cvusa --devices 0,1
 ```
 
-Use `--run-name` to select another output directory and `--resume` to continue
-from a checkpoint.
+To continue an interrupted run, append `--resume <checkpoint>`.
 
-## Evaluation
+### Evaluation
 
-Evaluation supports one or more GPUs and draws an independent random heading
-for every query--FoV pair. The sampled schedule is saved with the results.
+Evaluate a checkpoint under random FoV crops:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m cor_geo.evaluate \
+python -m cor_geo.evaluate \
   --run-dir outputs/cvact/cor_geo_cvact \
   --checkpoint epoch_064
 ```
 
-Pass `--crop-schedule <file.parquet>` to replay a recorded draw. To evaluate
-additional FoVs, use `--fovs ... --allow-unseen-fovs`.
+Replace `cvact` with `cvusa` to evaluate the CVUSA model. Add `--devices 0,1` to use two GPUs. By default, evaluation draws a new random crop schedule. Use `--crop-schedule <file.parquet>` to replay a recorded schedule.
 
-## Results
+## Pretrained Models and Results
 
-Validation Macro R@1 over 360°, 180°, 90°, and 70° random crops:
+Pretrained checkpoints will be released with the preprint.
 
-| Dataset | Macro R@1 |
-|:--|--:|
-| CVACT | 75.4 |
-| CVUSA | 79.8 |
+Validation Macro R@1 averaged over 360°, 180°, 90°, and 70° random crops:
 
-These values come from one trained checkpoint and one recorded random-crop
-evaluation. Download links will be added after the checkpoint release.
-
-## Tests
-
-The unit tests require neither datasets nor pretrained weights.
-
-```bash
-pip install -e ".[dev]"
-ruff check src tests
-pytest -q
-```
+| Dataset | Checkpoint | Macro R@1 (%) |
+|:--|:--:|--:|
+| CVACT | Coming soon | 75.4 |
+| CVUSA | Coming soon | 79.8 |
 
 ## Citation
 
-The BibTeX entry will be added when the preprint is available.
+The BibTeX entry will be added when the preprint becomes available.
+
+## Acknowledgements
+
+CoR-Geo uses the [DINOv2](https://github.com/facebookresearch/dinov2) backbone. We thank its authors and the providers of CVACT and CVUSA for making their research resources available.
 
 ## License
 
-The source code is released under the [MIT License](LICENSE). CoR-Geo uses
-[DINOv2](https://github.com/facebookresearch/dinov2) as an external dependency;
-its code and pretrained weights remain subject to the upstream license.
+The CoR-Geo source code is released under the [MIT License](LICENSE). Third-party code, pretrained weights, and datasets remain subject to their respective licenses.

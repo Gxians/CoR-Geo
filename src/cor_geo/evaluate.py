@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -785,10 +786,50 @@ def load_random_crop_schedule(
 
 # ---- command-line interface ----
 
-"""Distributed exact evaluation with random or replayed FoV crops."""
+"""Exact evaluation with random or replayed FoV crops."""
 
 
 FOVS = (360, 180, 90, 70)
+
+
+def _parse_device_ids(value: str | None) -> tuple[int, ...]:
+    """Resolve the public device list while keeping single-GPU as the default."""
+    if value is None:
+        return (0,)
+    fields = [field.strip() for field in value.split(",")]
+    if not fields or any(not field for field in fields):
+        raise ValueError("--devices must be a comma-separated list such as 0 or 0,1")
+    try:
+        devices = tuple(int(field) for field in fields)
+    except ValueError as error:
+        raise ValueError("--devices must contain non-negative integer GPU IDs") from error
+    if any(device < 0 for device in devices):
+        raise ValueError("--devices must contain non-negative integer GPU IDs")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must not contain duplicate GPU IDs")
+    return devices
+
+
+def _launch_workers(devices_arg: str | None) -> None:
+    """Hide the distributed launcher behind the public ``--devices`` option."""
+    if "RANK" in os.environ:
+        return
+    devices = _parse_device_ids(devices_arg)
+    if devices_arg is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
+    else:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc-per-node={len(devices)}",
+        "-m",
+        "cor_geo.evaluate",
+        *sys.argv[1:],
+    ]
+    os.execvpe(sys.executable, command, os.environ.copy())
 
 
 def _initialize(runtime: dict[str, Any]) -> tuple[int, int, int]:
@@ -797,7 +838,7 @@ def _initialize(runtime: dict[str, Any]) -> tuple[int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "-1"))
     configured = runtime["distributed"].get("world_size", "auto")
     if rank < 0 or local_rank < 0 or world_size < 1:
-        raise RuntimeError("Launch evaluation with torchrun")
+        raise RuntimeError("Evaluation launcher did not initialize the distributed runtime")
     if configured != "auto" and world_size != int(configured):
         raise RuntimeError(f"Runtime expects world_size={configured}, received {world_size}")
     torch.cuda.set_device(local_rank)
@@ -913,6 +954,10 @@ def _validate_satellite_bank(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--devices",
+        help="Comma-separated GPU IDs; defaults to one GPU (for example: 0,1)",
+    )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", choices=["val", "test"], default="val")
@@ -956,6 +1001,7 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    _launch_workers(args.devices)
     active_fovs = tuple(map(int, args.fovs))
     if active_fovs != FOVS and not args.allow_unseen_fovs:
         raise ValueError(f"FoVs must be supplied in exact order {FOVS}")
