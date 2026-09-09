@@ -17,6 +17,7 @@ from time import perf_counter
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.distributed as distributed
 from torch import nn
@@ -30,6 +31,22 @@ from cor_geo.datasets import (
     cache_request,
     collate_mixed_fov,
     read_manifest,
+    write_parquet_atomic,
+)
+from cor_geo.evaluate import (
+    EncodedSatelliteViews,
+    _bounds,
+    _merge_satellite_shards,
+    _save_encoded,
+    draw_random_crop_schedule,
+    encode_ground_views,
+    encode_satellite_views,
+    exact_evaluate_shard,
+    load_random_crop_schedule,
+    prepare_satellite_views,
+    register_evaluation_resamplers,
+    resolve_evaluation_fov_geometry,
+    retrieval_metrics,
 )
 from cor_geo.losses import CoRGeoLoss
 from cor_geo.mining import HardNegativeCandidateBank, load_compact_hard_pool, write_compact_hard_pool
@@ -1000,6 +1017,314 @@ def _loss_from_config(model_config: dict[str, Any]) -> CoRGeoLoss:
     )
 
 
+def _prepare_validation_schedule(
+    run_root: Path,
+    manifest: pd.DataFrame,
+    split: str,
+    fovs: tuple[int, ...],
+    rank: int,
+    allow_create: bool,
+) -> tuple[dict[int, np.ndarray], pd.DataFrame, str, Path]:
+    """Create one random validation schedule per run, then replay it forever."""
+    schedule_path = run_root / "evaluations" / f"{split}_random" / "random_crop_schedule.parquet"
+    result: tuple[dict[int, np.ndarray], pd.DataFrame, str] | None = None
+    error: str | None = None
+    if rank == 0:
+        try:
+            if schedule_path.is_file():
+                result = load_random_crop_schedule(schedule_path, manifest, split, fovs)
+            elif not allow_create:
+                raise FileNotFoundError(f"Resume requires the original validation crop schedule: {schedule_path}")
+            else:
+                result = draw_random_crop_schedule(manifest, split, fovs)
+                write_parquet_atomic(result[1], schedule_path)
+        except Exception as exception:
+            error = f"{type(exception).__name__}: {exception}"
+    error = _broadcast(error, rank)
+    if error:
+        raise RuntimeError(f"Validation crop schedule failed: {error}")
+    values = [result if rank == 0 else None]
+    distributed.broadcast_object_list(values, src=0)
+    if values[0] is None:
+        raise RuntimeError("Validation crop schedule broadcast failed")
+    angles, schedule, schedule_hash = values[0]
+    return angles, schedule, schedule_hash, schedule_path
+
+
+def _macro_recall_at_1(summary: dict[str, Any], fovs: tuple[int, ...]) -> float:
+    """Return the equally weighted R@1 mean used for model selection."""
+    values = [float(summary["fovs"][str(fov)]["R@1"]) for fov in fovs]
+    if len(values) != len(fovs) or not np.isfinite(values).all():
+        raise ValueError("Validation summary does not contain finite R@1 values for every FoV")
+    return float(np.mean(values))
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _update_best_validation(
+    run_root: Path,
+    checkpoint: Path,
+    summary: dict[str, Any],
+) -> bool:
+    """Replace the best checkpoint only when Macro R@1 strictly improves."""
+    best_summary_path = run_root / "evaluations" / "val_random" / "best_summary.json"
+    previous: dict[str, Any] | None = None
+    if best_summary_path.is_file():
+        with best_summary_path.open("r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+    current_score = float(summary["selection"]["macro_r1"])
+    previous_score = float(previous["selection"]["macro_r1"]) if previous is not None else -math.inf
+    best_checkpoint = run_root / "checkpoints" / "best.ckpt"
+    improved = current_score > previous_score
+    recover_missing_checkpoint = (
+        previous is not None
+        and current_score == previous_score
+        and int(summary["selected_epoch"]) == int(previous["selected_epoch"])
+        and not best_checkpoint.is_file()
+    )
+    if not improved and not recover_missing_checkpoint:
+        return False
+    _atomic_copy(checkpoint, best_checkpoint)
+    best_summary = dict(summary)
+    best_summary["selection"] = {
+        **summary["selection"],
+        "best_checkpoint": str(best_checkpoint),
+        "source_checkpoint": str(checkpoint),
+    }
+    write_json(best_summary_path, best_summary, overwrite=True)
+    return improved
+
+
+def _run_training_validation(
+    model: CoRGeoModel,
+    config: ExperimentConfig,
+    run_root: Path,
+    checkpoint: Path,
+    epoch: int,
+    manifest: pd.DataFrame,
+    manifest_path: Path,
+    random_angles: dict[int, np.ndarray],
+    schedule_hash: str,
+    schedule_path: Path,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> dict[str, Any] | None:
+    """Evaluate one training checkpoint on the persistent random Val draw."""
+    split = str(config.evaluation["report_split"])
+    fovs = tuple(map(int, config.evaluation["main_fovs"]))
+    evaluation_root = run_root / "evaluations" / f"{split}_random" / f"epoch_{epoch:03d}"
+    summary_path = evaluation_root / "summary.json"
+    cached: dict[str, Any] | None = None
+    cached_error: str | None = None
+    if rank == 0 and summary_path.is_file():
+        try:
+            with summary_path.open("r", encoding="utf-8") as handle:
+                cached = json.load(handle)
+            if int(cached["selected_epoch"]) != epoch:
+                raise ValueError("Cached validation epoch is inconsistent")
+            if cached["random_crop_protocol"]["schedule_sha256"] != schedule_hash:
+                raise ValueError("Cached validation used a different crop schedule")
+        except Exception as exception:
+            cached_error = f"{type(exception).__name__}: {exception}"
+    cached_error = _broadcast(cached_error, rank)
+    if cached_error:
+        raise RuntimeError(f"Cached validation summary failed: {cached_error}")
+    cached_values = [cached if rank == 0 else None]
+    distributed.broadcast_object_list(cached_values, src=0)
+    if cached_values[0] is not None:
+        return cached_values[0] if rank == 0 else None
+
+    model_config = config.model
+    runtime = config.runtime
+    staging_root = evaluation_root / str(runtime["storage"]["staging_directory"])
+    setup_error: str | None = None
+    if rank == 0:
+        try:
+            if staging_root.exists():
+                shutil.rmtree(staging_root)
+            staging_root.mkdir(parents=True, exist_ok=False)
+        except Exception as exception:
+            setup_error = f"{type(exception).__name__}: {exception}"
+    setup_error = _broadcast(setup_error, rank)
+    if setup_error:
+        raise RuntimeError(f"Validation setup failed: {setup_error}")
+    distributed.barrier()
+
+    previous_training = model.training
+    previous_epoch = int(model.backbone.current_epoch)
+    previous_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+    previous_random_state = capture_random_state()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = bool(config.evaluation["exact"]["allow_tf32"])
+        geometries = resolve_evaluation_fov_geometry(fovs, model_config)
+        register_evaluation_resamplers(model, geometries, device)
+        cache_root, require_cache = cache_request(config.train, split)
+        validation_dataset = CrossViewDataset(
+            manifest,
+            global_seed=int(config.train["seed"]),
+            ground_height=int(model_config["input"]["ground_height"]),
+            panorama_width=int(model_config["input"]["panorama_width"]),
+            satellite_size=int(model_config["input"]["satellite_size"][0]),
+            ground_widths={fov: geometry.aligned_input_width for fov, geometry in geometries.items()},
+            resized_cache_root=cache_root,
+            require_resized_cache=require_cache,
+            dataset_name=str(config.dataset["dataset"]),
+        )
+        start, stop = _bounds(len(manifest), rank, world_size)
+        indices = np.arange(start, stop, dtype=np.int64)
+        export = runtime["descriptor_export"]
+        rank_root = staging_root / f"rank_{rank:02d}"
+        rank_root.mkdir(parents=True, exist_ok=False)
+
+        satellite_shard = encode_satellite_views(
+            model,
+            validation_dataset,
+            indices,
+            device,
+            int(export["batch_size_per_gpu"]),
+            int(export["workers_per_rank"]),
+        )
+        _save_encoded(rank_root / "satellite", satellite_shard)
+        distributed.barrier()
+
+        merge_error: str | None = None
+        if rank == 0:
+            try:
+                satellite_ids = _merge_satellite_shards(
+                    staging_root,
+                    staging_root / "satellite_bank",
+                    world_size,
+                    len(manifest),
+                    int(model.angular_bins),
+                    int(model.direction_dim),
+                )
+                if satellite_ids != manifest["satellite_id"].astype(str).tolist():
+                    raise ValueError("Validation satellite IDs differ from the manifest")
+            except Exception as exception:
+                merge_error = f"{type(exception).__name__}: {exception}"
+        merge_error = _broadcast(merge_error, rank)
+        if merge_error:
+            raise RuntimeError(f"Validation satellite merge failed: {merge_error}")
+        distributed.barrier()
+
+        satellite = EncodedSatelliteViews(
+            np.load(staging_root / "satellite_bank" / "direction.fp32.npy", mmap_mode="r", allow_pickle=False),
+            np.load(staging_root / "satellite_bank" / "satellite_ids.npy", allow_pickle=False).astype(str).tolist(),
+        )
+        queries = encode_ground_views(
+            model,
+            validation_dataset,
+            indices,
+            fovs,
+            device,
+            int(export["batch_size_per_gpu"]),
+            int(export["workers_per_rank"]),
+            random_roll_angles_deg={fov: random_angles[fov][start:stop] for fov in fovs},
+        )
+        expected_ids = manifest.iloc[start:stop]["query_id"].astype(str).tolist()
+        if any(queries[fov].ids != expected_ids for fov in fovs):
+            raise ValueError("Validation query IDs differ from the manifest")
+
+        prepared_satellite = prepare_satellite_views(satellite, device)
+        exact = runtime["exact_score"]
+        for fov in fovs:
+            predictions, _ = exact_evaluate_shard(
+                queries[fov],
+                fov,
+                satellite,
+                device,
+                query_chunk_size=int(exact["query_chunk_size"]),
+                location_chunk_size=int(exact["location_chunk_size"]),
+                score_config=dict(model_config["score"]),
+                split=split,
+                dataset_name=str(config.dataset["dataset"]),
+                prepared_satellite=prepared_satellite,
+            )
+            write_parquet_atomic(predictions, rank_root / f"predictions_fov_{fov}.parquet")
+        distributed.barrier()
+
+        checkpoint_hash = _broadcast(sha256_file(checkpoint) if rank == 0 else None, rank)
+        summary: dict[str, Any] | None = None
+        publish_error: str | None = None
+        if rank == 0:
+            try:
+                summary = {
+                    "output_directory": str(evaluation_root),
+                    "dataset": str(config.dataset["dataset"]),
+                    "selected_epoch": int(epoch),
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": checkpoint_hash,
+                    "split": split,
+                    "crop_mode": "random",
+                    "manifest_sha256": sha256_file(manifest_path),
+                    "execution": {
+                        "world_size": int(world_size),
+                        "used_for_model_selection": True,
+                        "single_satellite_bank_for_all_fovs": True,
+                    },
+                    "random_crop_protocol": {
+                        "angle_sampler": "independent_uniform_integer_0_359",
+                        "operation": "right_roll_then_left_fov_crop",
+                        "schedule_source": "persistent_run_schedule",
+                        "schedule": str(schedule_path),
+                        "schedule_sha256": schedule_hash,
+                    },
+                    "fovs": {},
+                }
+                prediction_root = evaluation_root / "predictions"
+                for fov in fovs:
+                    parts = [
+                        pd.read_parquet(
+                            staging_root / f"rank_{shard_rank:02d}" / f"predictions_fov_{fov}.parquet",
+                            engine="pyarrow",
+                        )
+                        for shard_rank in range(world_size)
+                    ]
+                    predictions = pd.concat(parts, ignore_index=True)
+                    if predictions["query_id"].astype(str).tolist() != manifest["query_id"].astype(str).tolist():
+                        raise ValueError("Merged validation predictions differ from the manifest")
+                    summary["fovs"][str(fov)] = retrieval_metrics(
+                        predictions["predicted_rank_1based"].to_numpy(np.int64),
+                        len(manifest),
+                        recall_ks=tuple(map(int, config.evaluation["metrics"]["recall_ks"])),
+                        r1_percent_rounding=str(config.evaluation["metrics"]["r1_percent_rounding"]),
+                    )
+                    write_parquet_atomic(predictions, prediction_root / f"{split}_fov{fov}.parquet")
+                macro_r1 = _macro_recall_at_1(summary, fovs)
+                summary["selection"] = {
+                    "metric": "macro_r1",
+                    "macro_r1": macro_r1,
+                    "fovs": list(fovs),
+                }
+                write_json(summary_path, summary)
+                shutil.rmtree(staging_root)
+            except Exception as exception:
+                publish_error = f"{type(exception).__name__}: {exception}"
+        publish_error = _broadcast(publish_error, rank)
+        if publish_error:
+            raise RuntimeError(f"Validation publication failed: {publish_error}")
+        summary_values = [summary if rank == 0 else None]
+        distributed.broadcast_object_list(summary_values, src=0)
+        return summary_values[0] if rank == 0 else None
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        model.set_train_epoch(previous_epoch)
+        model.train(previous_training)
+        restore_random_state(previous_random_state)
+        torch.cuda.empty_cache()
+
+
 def train(
     config: ExperimentConfig,
     run_name: str,
@@ -1021,6 +1346,10 @@ def train(
         if not path.is_file():
             raise FileNotFoundError(path)
     train_manifest = read_manifest(manifest_paths["train"])
+    validation_split = str(config.evaluation["report_split"])
+    validation_manifest = read_manifest(manifest_paths[validation_split]).reset_index(drop=True)
+    validation_fovs = tuple(map(int, config.evaluation["main_fovs"]))
+    validation_interval = int(config.evaluation["during_training"]["interval_epochs"])
     global_batch = int(config.train["distributed"]["global_batch_size"])
     steps_per_epoch = len(train_manifest) // global_batch
     if steps_per_epoch <= 0:
@@ -1082,10 +1411,19 @@ def train(
     if setup_error:
         raise RuntimeError(setup_error)
     distributed.barrier()
+    validation_angles, _, validation_schedule_hash, validation_schedule_path = _prepare_validation_schedule(
+        run_root,
+        validation_manifest,
+        validation_split,
+        validation_fovs,
+        rank,
+        allow_create=resume is None,
+    )
 
     provenance = {
         "manifest_hashes": {split: sha256_file(path) for split, path in manifest_paths.items()},
         "model_config_sha256": sha256_json(config.model),
+        "validation_crop_schedule_sha256": validation_schedule_hash,
         "training_topology": {
             "world_size": topology.world_size,
             "per_gpu_batch_size": topology.per_gpu_batch_size,
@@ -1110,6 +1448,8 @@ def train(
                 "Resume must use the checkpoint's original GPU topology; "
                 "one- and two-GPU runs are protocol-equivalent but not bitwise-interchangeable"
             )
+        if payload.get("validation_crop_schedule_sha256") != validation_schedule_hash:
+            raise ValueError("Resume validation crop schedule differs from the checkpoint")
         restore_random_state(payload)
         start_epoch = int(payload["completed_epoch"]) + 1
         distributed.barrier()
@@ -1120,6 +1460,29 @@ def train(
 
     fovs = list(map(int, config.train["mixed_fov_batch"]["fovs"]))
     refresh_epochs = set(map(int, config.train["hard_mining"]["refresh_after_epochs"]))
+    if (resume is not None) and completed_epoch % validation_interval == 0:
+        retained_checkpoint = run_root / "checkpoints" / f"epoch_{completed_epoch:03d}.ckpt"
+        if not retained_checkpoint.is_file():
+            retained_checkpoint = run_root / "checkpoints" / "last.ckpt"
+        summary = _run_training_validation(
+            model,
+            config,
+            run_root,
+            retained_checkpoint,
+            completed_epoch,
+            validation_manifest,
+            manifest_paths[validation_split],
+            validation_angles,
+            validation_schedule_hash,
+            validation_schedule_path,
+            device,
+            rank,
+            world_size,
+        )
+        if rank == 0:
+            assert summary is not None
+            _update_best_validation(run_root, retained_checkpoint, summary)
+        distributed.barrier()
     if (resume is not None) and completed_epoch in refresh_epochs:
         retained_checkpoint = run_root / "checkpoints" / f"epoch_{completed_epoch:03d}.ckpt"
         if not retained_checkpoint.is_file():
@@ -1154,6 +1517,7 @@ def train(
     )
     metrics_path = run_root / "train_metrics.jsonl"
     retained_epochs = set(map(int, config.train["checkpoint"]["retained_epochs"]))
+    progress_every_steps = int(config.train["progress_every_steps"])
     for epoch in range(start_epoch, final_epoch + 1):
         ddp_model.train(True)
         model.set_train_epoch(epoch)
@@ -1180,6 +1544,7 @@ def train(
             else None
         )
         plan = _broadcast(plan, rank)
+        epoch_steps = len(plan)
         sampler.set_plan(plan, epoch)
         for step_in_epoch, batch in enumerate(loader, start=1):
             local_indices = batch["manifest_index"].to(device, non_blocking=True)
@@ -1221,6 +1586,8 @@ def train(
             )
             optimizer.step()
             scheduler.step_completed()
+            loss_value = float(losses.total.detach())
+            joint_accuracy = float(losses.joint_in_batch_accuracy)
             if rank == 0:
                 append_jsonl(
                     metrics_path,
@@ -1230,14 +1597,20 @@ def train(
                         "global_step": scheduler.global_step,
                         "batch_kind": batch_kind,
                         "fov_counts": {str(key): value for key, value in local_counts.items()},
-                        "loss": float(losses.total.detach()),
+                        "loss": loss_value,
                         "joint_retrieval_loss": float(losses.joint_retrieval),
                         "order_retrieval_loss": float(losses.order_retrieval),
-                        "joint_in_batch_accuracy": float(losses.joint_in_batch_accuracy),
+                        "joint_in_batch_accuracy": joint_accuracy,
                         "order_in_batch_accuracy": float(losses.order_in_batch_accuracy),
                         "learning_rates": learning_rates,
                     },
                 )
+                if step_in_epoch % progress_every_steps == 0 or step_in_epoch == epoch_steps:
+                    print(
+                        f"Epoch {epoch}/{final_epoch} | Step {step_in_epoch}/{epoch_steps} | "
+                        f"Loss {loss_value:.3f} | Joint Acc. {100.0 * joint_accuracy:.1f}%",
+                        flush=True,
+                    )
             del output, losses, ground_by_fov, positions_by_fov
 
         optimizer.zero_grad(set_to_none=True)
@@ -1270,6 +1643,38 @@ def train(
             rank,
         )
         distributed.barrier()
+        if epoch % validation_interval == 0:
+            if rank == 0:
+                print(f"Validation after epoch {epoch}: FoV {list(validation_fovs)}", flush=True)
+            summary = _run_training_validation(
+                model,
+                config,
+                run_root,
+                Path(checkpoint_value),
+                epoch,
+                validation_manifest,
+                manifest_paths[validation_split],
+                validation_angles,
+                validation_schedule_hash,
+                validation_schedule_path,
+                device,
+                rank,
+                world_size,
+            )
+            if rank == 0:
+                assert summary is not None
+                improved = _update_best_validation(run_root, Path(checkpoint_value), summary)
+                fov_text = " | ".join(
+                    f"R@1 {fov}° {100.0 * float(summary['fovs'][str(fov)]['R@1']):.1f}%"
+                    for fov in validation_fovs
+                )
+                print(
+                    f"Val epoch {epoch} | {fov_text} | "
+                    f"Macro R@1 {100.0 * float(summary['selection']['macro_r1']):.1f}%"
+                    f"{' | New best' if improved else ''}",
+                    flush=True,
+                )
+            distributed.barrier()
         if epoch in refresh_epochs:
             _generate_hard_pools(
                 model,

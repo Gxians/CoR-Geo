@@ -1,8 +1,8 @@
-# CoR-Geo
+# CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization
 
-Official implementation of **CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization**.
+[[arXiv](https://arxiv.org/abs/XXXX.XXXXX)]
 
-> The paper and pretrained models will be released with the preprint.
+Official method implementation of CoR-Geo.
 
 ## Introduction
 
@@ -21,7 +21,7 @@ The code has been tested with:
 - PyTorch 2.3.1
 - CUDA 12.1
 
-Install CoR-Geo with:
+Install CoR-Geo and its required environment with:
 
 ```bash
 git clone https://github.com/Gxians/CoR-Geo.git
@@ -29,16 +29,18 @@ cd CoR-Geo
 
 conda create -n cor_geo python=3.10 -y
 conda activate cor_geo
-pip install -e . --no-build-isolation
+pip install -e .
 ```
 
 ### DINOv2 Backbone
 
-Download the DINOv2 source code and ViT-B/14 pretrained weights:
+CoR-Geo uses the official [DINOv2](https://github.com/facebookresearch/dinov2) ViT-B/14 implementation and pretrained weights. Run:
 
 ```bash
 bash scripts/setup_dinov2.sh
 ```
+
+The script downloads a pinned DINOv2 source revision and the ViT-B/14 pretrained checkpoint.
 
 ## Dataset Preparation
 
@@ -48,26 +50,29 @@ Build the manifests and resized-image caches with:
 
 ```bash
 python -m cor_geo.datasets --dataset cvact
-python -m cor_geo.datasets --dataset cvusa
 ```
+
+Replace `cvact` with `cvusa` to prepare CVUSA.
 
 ## Usage
 
 ### Training
 
-Train on CVACT or CVUSA using one GPU:
+Train on CVACT using one GPU:
 
 ```bash
 python -m cor_geo.train --dataset cvact
-python -m cor_geo.train --dataset cvusa
 ```
 
 Use two GPUs for the setting reported in the paper:
 
 ```bash
 python -m cor_geo.train --dataset cvact --devices 0,1
-python -m cor_geo.train --dataset cvusa --devices 0,1
 ```
+
+Replace `cvact` with `cvusa` to train on CVUSA.
+
+Training evaluates the Val split every 8 epochs at 360°, 180°, 90°, and 70°. One random crop schedule is created per run and reused by every checkpoint. The checkpoint with the highest four-FoV Macro R@1 is saved as `checkpoints/best.ckpt`, with its metrics in `evaluations/val_random/best_summary.json`.
 
 To continue an interrupted run, append `--resume <checkpoint>`.
 
@@ -76,16 +81,12 @@ To continue an interrupted run, append `--resume <checkpoint>`.
 Evaluate a checkpoint under random FoV crops:
 
 ```bash
-python -m cor_geo.evaluate \
-  --run-dir outputs/cvact/cor_geo_cvact \
-  --checkpoint epoch_064
+python -m cor_geo.evaluate --dataset cvact
 ```
 
-Replace `cvact` with `cvusa` to evaluate the CVUSA model. Add `--devices 0,1` to use two GPUs. By default, evaluation draws a new random crop schedule. Use `--crop-schedule <file.parquet>` to replay a recorded schedule.
+By default, evaluation loads `outputs/cvact/cor_geo_cvact/checkpoints/best.ckpt`. Replace `cvact` with `cvusa` to evaluate the CVUSA model, or append `--checkpoint epoch_008` to evaluate another retained checkpoint. Add `--devices 0,1` to use two GPUs. Val evaluation reuses the run's recorded random crop schedule. Use `--crop-schedule <file.parquet>` to replay another recorded schedule.
 
-## Pretrained Models and Results
-
-Pretrained checkpoints will be released with the preprint.
+## Results
 
 Validation Macro R@1 averaged over 360°, 180°, 90°, and 70° random crops:
 
@@ -94,14 +95,21 @@ Validation Macro R@1 averaged over 360°, 180°, 90°, and 70° random crops:
 | CVACT | Coming soon | 75.4 |
 | CVUSA | Coming soon | 79.8 |
 
-## Citation
-
-The BibTeX entry will be added when the preprint becomes available.
-
 ## Acknowledgements
 
-CoR-Geo uses the [DINOv2](https://github.com/facebookresearch/dinov2) backbone. We thank its authors and the providers of CVACT and CVUSA for making their research resources available.
+Parts of this repo are inspired by the following repositories:
 
-## License
+[DINOv2](https://github.com/facebookresearch/dinov2)
 
-The CoR-Geo source code is released under the [MIT License](LICENSE). Third-party code, pretrained weights, and datasets remain subject to their respective licenses.
+## Citation
+
+If you find this work useful, please consider citing:
+
+```bibtex
+@article{author2026corgeo,
+  title   = {CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization},
+  author  = {...},
+  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  year    = {2026}
+}
+```

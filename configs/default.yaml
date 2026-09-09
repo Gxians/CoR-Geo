@@ -105,6 +105,7 @@ model:
 train:
   seed: 42
   epochs: 64
+  progress_every_steps: 100
   distributed:
     enabled: true
     backend: nccl
@@ -313,6 +314,10 @@ evaluation:
   - 90
   - 70
   auxiliary_fovs: []
+  during_training:
+    enabled: true
+    interval_epochs: 8
+    selection_metric: macro_r1
   exact:
     encode_dtype: float32
     descriptor_storage_dtype: float32

@@ -227,6 +227,7 @@ class ExperimentConfig:
     model: dict[str, Any]
     train: dict[str, Any]
     evaluation: dict[str, Any]
+    runtime: dict[str, Any]
     paths: dict[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
@@ -235,6 +236,7 @@ class ExperimentConfig:
             "model": self.model,
             "train": self.train,
             "evaluation": self.evaluation,
+            "runtime": self.runtime,
             "paths": self.paths,
         }
 
@@ -301,6 +303,7 @@ def load_experiment_config(
         model=deepcopy(shared["model"]),
         train=train,
         evaluation=deepcopy(shared["evaluation"]),
+        runtime=deepcopy(shared["runtime"]),
         paths=deepcopy(shared["paths"]),
     )
     validate_experiment_config(config)
@@ -322,6 +325,7 @@ def validate_experiment_config(config: ExperimentConfig) -> None:
     _expect(isinstance(config.train.get("seed"), int), "Training seed must be an integer")
     epochs = int(config.train["epochs"])
     _expect(epochs > 0, "epochs must be positive")
+    _expect(int(config.train["progress_every_steps"]) > 0, "progress_every_steps must be positive")
 
     distributed = config.train["distributed"]
     _expect(distributed.get("world_size") == "auto", "Launcher must select world_size")
@@ -512,7 +516,13 @@ def validate_experiment_config(config: ExperimentConfig) -> None:
 
     evaluation_fovs = list(map(int, config.evaluation["main_fovs"]))
     _expect(bool(evaluation_fovs) and len(evaluation_fovs) == len(set(evaluation_fovs)), "Invalid evaluation FoVs")
-    _expect(str(config.evaluation["report_split"]) in splits, "Evaluation split is not configured")
+    _expect(evaluation_fovs == fovs, "Automatic validation FoVs must match the four training FoVs")
+    _expect(str(config.evaluation["report_split"]) == "val", "Automatic model selection must use Val")
+    during_training = config.evaluation["during_training"]
+    _expect(during_training.get("enabled") is True, "Automatic validation must be enabled")
+    interval = int(during_training["interval_epochs"])
+    _expect(interval > 0, "Validation interval must be positive")
+    _expect(during_training.get("selection_metric") == "macro_r1", "Best-model selection must use Macro R@1")
     metrics = config.evaluation["metrics"]
     _expect(all(int(value) > 0 for value in metrics["recall_ks"]), "Recall cutoffs must be positive")
     _expect(metrics["r1_percent_rounding"] in {"floor", "ceil"}, "Unsupported R@1% rounding")
@@ -522,6 +532,8 @@ def validate_experiment_config(config: ExperimentConfig) -> None:
         len(retained) == len(set(retained)) and all(1 <= epoch <= epochs for epoch in retained),
         "Retained checkpoint epochs are invalid",
     )
+    validation_epochs = set(range(interval, epochs + 1, interval))
+    _expect(validation_epochs <= set(retained), "Every automatic validation epoch must retain a checkpoint")
 
 
 def resolve_project_path(path: str | Path, project_root: str | Path) -> Path:

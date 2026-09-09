@@ -26,8 +26,14 @@ from cor_geo.content_order import ConservativeAngularResampler
 from cor_geo.datasets import CrossViewDataset, SampleRequest, cache_request, read_manifest, write_parquet_atomic
 from cor_geo.matching import cyclic_hard_max_score
 from cor_geo.model import CoRGeoModel
-from cor_geo.train import load_checkpoint
-from cor_geo.utils import configure_deterministic_algorithms, load_yaml, sha256_file, sha256_json, write_json
+from cor_geo.utils import (
+    configure_deterministic_algorithms,
+    load_yaml,
+    resolve_project_path,
+    sha256_file,
+    sha256_json,
+    write_json,
+)
 
 """Location-level Recall definitions."""
 
@@ -318,6 +324,7 @@ def encode_satellite_views(
     """Encode each satellite exactly once."""
     resolved = _underlying(model)
     was_training = resolved.training
+    previous_epoch = int(resolved.backbone.current_epoch)
     resolved.eval()
     index_list = list(map(int, indices))
     direction: np.ndarray | None = None
@@ -351,8 +358,8 @@ def encode_satellite_views(
     if direction is None or cursor != len(index_list):
         raise RuntimeError("Satellite descriptor export is incomplete")
     if was_training:
+        resolved.set_train_epoch(previous_epoch)
         resolved.train(True)
-        resolved.set_train_epoch(1)
     return EncodedSatelliteViews(direction, ids)
 
 
@@ -371,6 +378,7 @@ def encode_ground_views(
     """Open each panorama once and encode all requested FoV crops."""
     resolved = _underlying(model)
     was_training = resolved.training
+    previous_epoch = int(resolved.backbone.current_epoch)
     resolved.eval()
     index_list = list(map(int, indices))
     normalized_fovs = tuple(map(int, fovs))
@@ -423,8 +431,8 @@ def encode_ground_views(
     if cursor != len(index_list):
         raise RuntimeError("Ground descriptor export is incomplete")
     if was_training:
+        resolved.set_train_epoch(previous_epoch)
         resolved.train(True)
-        resolved.set_train_epoch(1)
     return {
         fov: EncodedGroundViews(
             storage[fov]["direction"],
@@ -865,6 +873,40 @@ def _checkpoint_path(run_dir: Path, name: str) -> Path:
     return run_dir / "checkpoints" / filename
 
 
+def _resolve_run_dir(
+    run_dir: str | None,
+    dataset: str,
+    paths: dict[str, Any],
+) -> Path:
+    """Resolve the conventional training run unless explicitly overridden."""
+    if run_dir is not None:
+        return Path(run_dir).expanduser().resolve()
+    output_root = resolve_project_path(paths["output_root"], paths["project_root"])
+    return output_root / dataset / f"cor_geo_{dataset}"
+
+
+def _load_model_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    expected_resolved_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Load model weights and the provenance needed by standalone evaluation."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    payload = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid checkpoint payload: {resolved}")
+    if payload.get("resolved_config_sha256") != sha256_json(payload["resolved_config"]):
+        raise ValueError("Checkpoint resolved-config hash is inconsistent")
+    if payload["resolved_config_sha256"] != sha256_json(expected_resolved_config):
+        raise ValueError("Checkpoint resolved config differs from the requested run config")
+    underlying = _underlying(model)
+    underlying.load_state_dict(payload["model_state"], strict=True)
+    underlying.set_train_epoch(int(payload["completed_epoch"]))
+    return payload
+
+
 def _save_encoded(root: Path, encoded: EncodedSatelliteViews) -> None:
     root.mkdir(parents=True, exist_ok=False)
     np.save(root / "direction.npy", encoded.direction.astype(np.float32), allow_pickle=False)
@@ -954,12 +996,16 @@ def _validate_satellite_bank(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=("cvact", "cvusa"), required=True)
     parser.add_argument(
         "--devices",
         help="Comma-separated GPU IDs; defaults to one GPU (for example: 0,1)",
     )
-    parser.add_argument("--run-dir", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--run-dir",
+        help="Training run directory; defaults to outputs/<dataset>/cor_geo_<dataset>",
+    )
+    parser.add_argument("--checkpoint", default="best")
     parser.add_argument("--split", choices=["val", "test"], default="val")
     parser.add_argument("--fovs", type=int, nargs="+", default=list(FOVS))
     parser.add_argument(
@@ -1012,9 +1058,14 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     succeeded = False
     try:
-        run_dir = Path(args.run_dir).expanduser().resolve()
+        run_dir = _resolve_run_dir(args.run_dir, args.dataset, shared["paths"])
         resolved = load_yaml(run_dir / "config_resolved.yaml")
         checkpoint_dataset_name = str(resolved["dataset"]["dataset"])
+        if checkpoint_dataset_name != args.dataset:
+            raise ValueError(
+                f"--dataset={args.dataset} does not match the checkpoint run dataset "
+                f"{checkpoint_dataset_name}"
+            )
         evaluation_dataset = (
             load_yaml(args.evaluation_dataset_config) if args.evaluation_dataset_config else resolved["dataset"]
         )
@@ -1040,34 +1091,45 @@ def main() -> None:
         checkpoint = _checkpoint_path(run_dir, args.checkpoint)
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
-        selected_epoch = int(checkpoint.stem.removeprefix("epoch_"))
-        if selected_epoch not in set(map(int, checkpoint_train_config["checkpoint"]["retained_epochs"])):
-            raise ValueError("Evaluation accepts retained checkpoint epochs only")
+        checkpoint_label = checkpoint.stem
+        if checkpoint_label != "best" and not checkpoint_label.startswith("epoch_"):
+            raise ValueError("Checkpoint must be best.ckpt or a retained epoch_NNN.ckpt")
         checkpoint_hash = sha256_file(checkpoint)
         project_root = Path(paths["project_root"])
         manifest_root = project_root / "data_manifests" / dataset_name
         manifest_path = manifest_root / f"{split}.parquet"
         manifest = read_manifest(manifest_path).reset_index(drop=True)
         manifest_hash = sha256_file(manifest_path)
-        schedule_values: list[tuple[dict[int, np.ndarray], pd.DataFrame, str] | None] = [None]
+        schedule_values: list[tuple[dict[int, np.ndarray], pd.DataFrame, str, str] | None] = [None]
         if rank == 0:
             if args.crop_schedule:
-                schedule_values[0] = load_random_crop_schedule(
+                angles, schedule, crop_hash = load_random_crop_schedule(
                     args.crop_schedule,
                     manifest,
                     split,
                     active_fovs,
                 )
+                schedule_values[0] = (angles, schedule, crop_hash, "user_supplied")
+            elif split == "val" and active_fovs == FOVS:
+                persistent_schedule = run_dir / "evaluations" / "val_random" / "random_crop_schedule.parquet"
+                if persistent_schedule.is_file():
+                    angles, schedule, crop_hash = load_random_crop_schedule(
+                        persistent_schedule,
+                        manifest,
+                        split,
+                        active_fovs,
+                    )
+                    schedule_values[0] = (angles, schedule, crop_hash, "persistent_run_schedule")
+                else:
+                    angles, schedule, crop_hash = draw_random_crop_schedule(manifest, split, active_fovs)
+                    schedule_values[0] = (angles, schedule, crop_hash, "new_random_draw")
             else:
-                schedule_values[0] = draw_random_crop_schedule(
-                    manifest,
-                    split,
-                    active_fovs,
-                )
+                angles, schedule, crop_hash = draw_random_crop_schedule(manifest, split, active_fovs)
+                schedule_values[0] = (angles, schedule, crop_hash, "new_random_draw")
         distributed.broadcast_object_list(schedule_values, src=0)
         if schedule_values[0] is None:
             raise RuntimeError("Random crop schedule broadcast failed")
-        random_roll_angles_deg, random_crop_schedule, crop_hash = schedule_values[0]
+        random_roll_angles_deg, random_crop_schedule, crop_hash, schedule_source = schedule_values[0]
         model_config_hash = sha256_json(model_config)
         fov_geometries = resolve_evaluation_fov_geometry(active_fovs, model_config)
 
@@ -1076,14 +1138,23 @@ def main() -> None:
             dinov2_root=paths["dinov2_root"],
             checkpoint_path=paths["checkpoints"]["dinov2_vitb14"],
         ).to(device)
-        payload = load_checkpoint(
+        payload = _load_model_checkpoint(
             checkpoint,
             model,
-            restore_rng=False,
             expected_resolved_config=resolved,
         )
-        if int(payload["completed_epoch"]) != selected_epoch:
+        selected_epoch = int(payload["completed_epoch"])
+        if checkpoint_label.startswith("epoch_") and int(checkpoint_label.removeprefix("epoch_")) != selected_epoch:
             raise ValueError("Checkpoint epoch metadata differs from its filename")
+        if selected_epoch not in set(map(int, checkpoint_train_config["checkpoint"]["retained_epochs"])):
+            raise ValueError("Evaluation accepts best.ckpt or retained checkpoint epochs only")
+        saved_schedule_hash = payload.get("validation_crop_schedule_sha256")
+        if (
+            schedule_source == "persistent_run_schedule"
+            and saved_schedule_hash is not None
+            and saved_schedule_hash != crop_hash
+        ):
+            raise ValueError("The run's validation crop schedule differs from the checkpoint")
         expected = {"model": (payload["model_config_sha256"], model_config_hash)}
         if not cross_dataset:
             expected["manifest"] = (
@@ -1311,7 +1382,7 @@ def main() -> None:
                     "angle_sampler": "independent_uniform_integer_0_359",
                     "operation": "right_roll_then_left_fov_crop",
                     "independent_random_angle_per_query_fov": True,
-                    "schedule_source": ("replayed" if args.crop_schedule else "new_random_draw"),
+                    "schedule_source": schedule_source,
                     "schedule": str(evaluation_root / "random_crop_schedule.parquet"),
                     "schedule_sha256": crop_hash,
                 }

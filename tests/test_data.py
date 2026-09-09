@@ -6,6 +6,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import yaml
@@ -20,9 +21,15 @@ from cor_geo.datasets import (
     read_manifest,
     write_parquet_atomic,
 )
-from cor_geo.evaluate import retrieval_metrics
+from cor_geo.evaluate import (
+    _checkpoint_path,
+    _resolve_run_dir,
+    draw_random_crop_schedule,
+    retrieval_metrics,
+    validate_random_crop_schedule,
+)
 from cor_geo.samplers import PlannedRankBatchSampler, build_epoch_plan
-from cor_geo.train import _parse_device_ids
+from cor_geo.train import _macro_recall_at_1, _parse_device_ids, _update_best_validation
 from cor_geo.utils import (
     ConfigError,
     load_experiment_config,
@@ -43,6 +50,11 @@ def test_public_configuration_is_valid_and_portable(dataset: str) -> None:
     paths = load_yaml(ROOT / "configs" / "default.yaml")["paths"]
     assert paths["project_root"] == "."
     assert all(not Path(value).is_absolute() for value in paths["datasets"].values())
+    assert config.evaluation["during_training"] == {
+        "enabled": True,
+        "interval_epochs": 8,
+        "selection_metric": "macro_r1",
+    }
 
 
 def test_validation_accepts_structurally_valid_experiment_variants() -> None:
@@ -74,6 +86,17 @@ def test_public_device_option_defaults_to_one_gpu_and_accepts_two() -> None:
     for invalid in ("", "0,", "-1", "0,0", "0,1,2", "gpu0"):
         with pytest.raises(ValueError):
             _parse_device_ids(invalid)
+
+
+def test_evaluation_defaults_to_the_standard_run_and_best_checkpoint(tmp_path: Path) -> None:
+    paths = {"project_root": str(tmp_path), "output_root": "outputs"}
+    run_dir = _resolve_run_dir(None, "cvact", paths)
+    assert run_dir == tmp_path / "outputs" / "cvact" / "cor_geo_cvact"
+    assert _checkpoint_path(run_dir, "best") == run_dir / "checkpoints" / "best.ckpt"
+    assert _checkpoint_path(run_dir, "epoch_008.ckpt") == run_dir / "checkpoints" / "epoch_008.ckpt"
+
+    explicit = _resolve_run_dir("custom/run", "cvact", paths)
+    assert explicit == Path("custom/run").resolve()
 
 
 def test_one_gpu_batch_matches_the_two_contiguous_rank_shards() -> None:
@@ -159,6 +182,50 @@ def test_random_crop_keeps_a_common_left_boundary_for_all_fovs() -> None:
     assert all(
         orientation_to_center_px(crop.orientation_u32, panorama_width) == crop.center_px for crop in crops.values()
     )
+
+
+def test_random_validation_schedule_can_be_replayed_for_all_fovs() -> None:
+    manifest = pd.DataFrame({"query_id": ["q0", "q1", "q2"]})
+    fovs = (360, 180, 90, 70)
+    angles, schedule, schedule_hash = draw_random_crop_schedule(
+        manifest,
+        "val",
+        fovs,
+        rng=np.random.default_rng(7),
+    )
+    replayed_angles, replayed_schedule, replayed_hash = validate_random_crop_schedule(
+        schedule,
+        manifest,
+        "val",
+        fovs,
+    )
+    assert replayed_hash == schedule_hash
+    assert replayed_schedule.equals(schedule)
+    assert all((replayed_angles[fov] == angles[fov]).all() for fov in fovs)
+
+
+def test_best_checkpoint_uses_macro_r1_and_keeps_the_earliest_tie(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    first = run_root / "checkpoints" / "epoch_008.ckpt"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"epoch-8")
+    summary = {
+        "selected_epoch": 8,
+        "fovs": {str(fov): {"R@1": value} for fov, value in zip((360, 180, 90, 70), (0.8, 0.7, 0.6, 0.5))},
+    }
+    summary["selection"] = {
+        "metric": "macro_r1",
+        "macro_r1": _macro_recall_at_1(summary, (360, 180, 90, 70)),
+        "fovs": [360, 180, 90, 70],
+    }
+    assert _update_best_validation(run_root, first, summary)
+    assert (run_root / "checkpoints" / "best.ckpt").read_bytes() == b"epoch-8"
+
+    tied = run_root / "checkpoints" / "epoch_016.ckpt"
+    tied.write_bytes(b"epoch-16")
+    tied_summary = {**summary, "selected_epoch": 16}
+    assert not _update_best_validation(run_root, tied, tied_summary)
+    assert (run_root / "checkpoints" / "best.ckpt").read_bytes() == b"epoch-8"
 
 
 def test_manifest_paths_remain_repository_relative(tmp_path: Path) -> None:
