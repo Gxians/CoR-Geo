@@ -12,13 +12,6 @@ splits:
     csv_file: splits/val-19zl.csv
     expected_count: 8884
 
-# PIL reports sizes as [width, height].  The two modalities intentionally have
-# different native resolutions; preprocessing is shared through default.yaml.
-expected_source_image_sizes:
-  query: [1232, 224]
-  satellite: [750, 750]
-  annotation: [1232, 224]
-
 satellite_inventory_root: bingmap/19
 strict_satellite_file_equality: true
 

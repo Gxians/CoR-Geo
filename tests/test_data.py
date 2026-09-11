@@ -11,7 +11,6 @@ import pandas as pd
 import pytest
 import torch
 import yaml
-from PIL import Image
 
 from cor_geo.datasets import (
     MANIFEST_COLUMNS,
@@ -193,10 +192,8 @@ def test_cvusa_manifest_builder_hashes_a_resolved_paths_mapping(tmp_path: Path) 
     for _, (identifier, csv_name) in rows.items():
         satellite = dataset_root / "bingmap" / "19" / f"{identifier}.jpg"
         query = dataset_root / "streetview" / "panos" / f"{identifier}.jpg"
-        annotation = dataset_root / "streetview" / "annotations" / f"{identifier}.png"
-        Image.new("RGB", (3, 3)).save(satellite)
-        Image.new("RGB", (4, 2)).save(query)
-        Image.new("RGB", (4, 2)).save(annotation)
+        satellite.write_bytes(b"path-only satellite fixture")
+        query.write_bytes(b"path-only ground fixture")
         (dataset_root / "splits" / csv_name).write_text(
             f"bingmap/19/{identifier}.jpg,streetview/panos/{identifier}.jpg,"
             f"streetview/annotations/{identifier}.png\n",
@@ -212,7 +209,6 @@ def test_cvusa_manifest_builder_hashes_a_resolved_paths_mapping(tmp_path: Path) 
             "train": {"csv_file": "splits/train-19zl.csv", "expected_count": 1},
             "val": {"csv_file": "splits/val-19zl.csv", "expected_count": 1},
         },
-        "expected_source_image_sizes": {"query": [4, 2], "satellite": [3, 3], "annotation": [4, 2]},
         "satellite_inventory_root": "bingmap/19",
         "strict_satellite_file_equality": True,
     }

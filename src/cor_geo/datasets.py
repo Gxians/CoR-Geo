@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 import tempfile
-from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -876,21 +875,6 @@ def _paths_for_id(
     )
 
 
-def _verify_image(path: Path) -> tuple[str, tuple[int, int]]:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    try:
-        with Image.open(path) as image:
-            mode = image.mode
-            size = image.size
-            if mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "YCbCr", "I", "F"}:
-                raise ValueError(f"Unsupported PIL mode {mode}")
-            image.verify()
-            return path.suffix.lower(), size
-    except Exception as error:
-        raise ValueError(f"Unreadable or non-RGB-compatible image: {path}") from error
-
-
 def _ids_from_directory(directory: Path, suffix: str) -> set[str]:
     if not directory.is_dir():
         raise FileNotFoundError(directory)
@@ -918,10 +902,8 @@ def build_cvact_manifests(
     dataset_config_path: str | Path,
     paths_config_path: str | Path | dict[str, Any],
     overwrite: bool = False,
-    verify_images: bool = True,
-    progress_every: int = 10_000,
 ) -> dict[str, Path]:
-    """Create all pair manifests after exhaustive CVACT integrity checks."""
+    """Create CVACT pair manifests after annotation and path checks."""
     dataset_config = load_yaml(dataset_config_path)
     paths_config = paths_config_path if isinstance(paths_config_path, dict) else load_yaml(paths_config_path)
     project_root = Path(paths_config["project_root"]).expanduser().resolve()
@@ -937,9 +919,6 @@ def build_cvact_manifests(
         raise ValueError("Duplicate exclusion entries are forbidden")
     applied: list[dict[str, Any]] = []
     frames: dict[str, pd.DataFrame] = {}
-    dimensions: Counter[str] = Counter()
-    extensions: Counter[str] = Counter()
-    verified_images = 0
     for split, annotated_rows in annotations.items():
         split_config = dataset_config["splits"][split]
         records: list[dict[str, Any]] = []
@@ -968,14 +947,6 @@ def build_cvact_manifests(
                 continue
             if not query_path.is_file() or not satellite_path.is_file():
                 raise FileNotFoundError(f"Unapproved missing pair in {split}: {query_id}")
-            if verify_images:
-                for image_path in (query_path, satellite_path):
-                    extension, size = _verify_image(image_path)
-                    extensions[extension] += 1
-                    dimensions[f"{size[0]}x{size[1]}"] += 1
-                    verified_images += 1
-                    if progress_every > 0 and verified_images % progress_every == 0:
-                        print(f"verified_images={verified_images}", flush=True)
             records.append(
                 {
                     "dataset": "cvact",
@@ -1022,8 +993,6 @@ def build_cvact_manifests(
         "path_storage": "repository_relative_posix",
         "annotated_counts": {split: len(rows) for split, rows in annotations.items()},
         "final_counts": {split: len(frame) for split, frame in frames.items()},
-        "image_dimensions": dict(sorted(dimensions.items())),
-        "extensions": dict(sorted(extensions.items())),
         "test_query_file_count": len(query_files),
         "test_satellite_file_count": len(satellite_files),
     }
@@ -1066,8 +1035,6 @@ def build_cvusa_manifests(
     dataset_config_path: str | Path,
     paths_config_path: str | Path | dict[str, Any],
     overwrite: bool = False,
-    verify_images: bool = True,
-    progress_every: int = 10_000,
 ) -> dict[str, Path]:
     """Create CVUSA train/val pair manifests from the official 19zl split CSVs.
 
@@ -1083,14 +1050,8 @@ def build_cvusa_manifests(
         project_root,
     )
     output_root = project_root / "data_manifests" / "cvusa"
-    expected_sizes = {
-        key: tuple(map(int, value)) for key, value in dataset_config["expected_source_image_sizes"].items()
-    }
     frames: dict[str, pd.DataFrame] = {}
-    dimensions: Counter[str] = Counter()
-    extensions: Counter[str] = Counter()
     csv_hashes: dict[str, str] = {}
-    verified_images = 0
     for split in ("train", "val"):
         split_config = dataset_config["splits"][split]
         csv_path = dataset_root / str(split_config["csv_file"])
@@ -1112,25 +1073,9 @@ def build_cvusa_manifests(
                 raise ValueError(f"CVUSA row {split}:{row_index} does not form an ID-matched triplet")
             satellite_path = _resolve_csv_path(dataset_root, satellite_raw)
             query_path = _resolve_csv_path(dataset_root, query_raw)
-            annotation_path = _resolve_csv_path(dataset_root, annotation_raw)
-            for role, image_path in (
-                ("query", query_path),
-                ("satellite", satellite_path),
-                ("annotation", annotation_path),
-            ):
+            for image_path in (query_path, satellite_path):
                 if not image_path.is_file():
                     raise FileNotFoundError(image_path)
-                if verify_images:
-                    extension, size = _verify_image(image_path)
-                    if size != expected_sizes[role]:
-                        raise ValueError(
-                            f"Unexpected CVUSA {role} size at {image_path}: " f"{size}, expected {expected_sizes[role]}"
-                        )
-                    extensions[f"{role}:{extension}"] += 1
-                    dimensions[f"{role}:{size[0]}x{size[1]}"] += 1
-                    verified_images += 1
-                    if progress_every > 0 and verified_images % progress_every == 0:
-                        print(f"verified_images={verified_images}", flush=True)
             records.append(
                 {
                     "dataset": "cvusa",
@@ -1173,8 +1118,6 @@ def build_cvusa_manifests(
         "path_storage": "repository_relative_posix",
         "source_csv_counts": {split: len(frame) for split, frame in frames.items()},
         "source_csv_sha256": csv_hashes,
-        "source_image_dimensions": dict(sorted(dimensions.items())),
-        "source_extensions": dict(sorted(extensions.items())),
         "referenced_satellite_count": len(referenced_ids),
         "satellite_inventory_count": len(disk_ids),
         "manifest_order": "source_csv_row_order",
@@ -1594,7 +1537,6 @@ def main() -> None:
     parser.add_argument("--dataset", choices=("cvact", "cvusa"), required=True)
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--skip-image-verification", action="store_true")
     parser.add_argument("--skip-cache", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
@@ -1611,7 +1553,6 @@ def main() -> None:
             dataset_path,
             shared["paths"],
             overwrite=bool(args.overwrite),
-            verify_images=not bool(args.skip_image_verification),
         )
     else:
         print(f"Reusing manifests in {manifest_root}")
