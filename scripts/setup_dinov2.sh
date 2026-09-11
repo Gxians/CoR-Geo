@@ -8,8 +8,19 @@ CHECKPOINT_PATH="$CHECKPOINT_ROOT/dinov2_vitb14_pretrain.pth"
 DINO_COMMIT="7764ea0f912e53c92e82eb78a2a1631e92725fc8"
 CHECKPOINT_URL="https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth"
 
+SOURCE_ONLY=false
+case "${1:-}" in
+    "") ;;
+    --source-only) SOURCE_ONLY=true ;;
+    *) echo "Usage: bash scripts/setup_dinov2.sh [--source-only]" >&2; exit 2 ;;
+esac
+if [[ $# -gt 1 ]]; then
+    echo "Usage: bash scripts/setup_dinov2.sh [--source-only]" >&2
+    exit 2
+fi
+
 command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
-mkdir -p "$PROJECT_ROOT/third_party" "$CHECKPOINT_ROOT"
+mkdir -p "$PROJECT_ROOT/third_party"
 
 if [[ -e "$DINO_ROOT" && ! -d "$DINO_ROOT/.git" ]]; then
     echo "Existing path is not a Git repository: $DINO_ROOT" >&2
@@ -30,6 +41,12 @@ if ! git -C "$DINO_ROOT" cat-file -e "${DINO_COMMIT}^{commit}" 2>/dev/null; then
 fi
 git -C "$DINO_ROOT" checkout --detach "$DINO_COMMIT"
 
+if [[ "$SOURCE_ONLY" == true ]]; then
+    echo "DINOv2 source:  $DINO_ROOT"
+    exit 0
+fi
+
+mkdir -p "$CHECKPOINT_ROOT"
 if [[ ! -s "$CHECKPOINT_PATH" ]]; then
     PARTIAL_PATH="${CHECKPOINT_PATH}.part"
     if command -v wget >/dev/null 2>&1; then

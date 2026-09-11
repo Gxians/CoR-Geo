@@ -418,20 +418,15 @@ def checkpoint_payload(
     }
 
 
-def save_epoch_checkpoint(
+def save_last_checkpoint(
     payload: dict[str, Any],
     checkpoint_dir: str | Path,
-    completed_epoch: int,
-    retain_epoch: bool = True,
-) -> tuple[Path, Path]:
-    """Replace last.ckpt and optionally retain an immutable epoch_NNN checkpoint."""
+) -> Path:
+    """Atomically replace the resumable last checkpoint."""
     directory = Path(checkpoint_dir).resolve()
-    epoch_path = directory / f"epoch_{completed_epoch:03d}.ckpt"
     last_path = directory / "last.ckpt"
-    if retain_epoch:
-        _atomic_torch_save(payload, epoch_path, overwrite=False)
     _atomic_torch_save(payload, last_path, overwrite=True)
-    return (epoch_path if retain_epoch else last_path), last_path
+    return last_path
 
 
 def load_checkpoint(
@@ -750,15 +745,14 @@ def _expected_pool_metadata(
 
 
 def _hard_pool_root(
-    run_root: Path,
+    run_cache_root: Path,
     source_epoch: int,
-    checkpoint_hash: str,
 ) -> Path:
-    return run_root / "artifacts" / "hard_negatives" / checkpoint_hash / f"epoch_{source_epoch}"
+    return run_cache_root / "hard_negatives" / f"epoch_{source_epoch:03d}"
 
 
 def _load_hard_pools(
-    run_root: Path,
+    run_cache_root: Path,
     epoch: int,
     fovs: list[int],
     provenance: dict[str, Any],
@@ -769,14 +763,15 @@ def _load_hard_pools(
     hard = train_config["hard_mining"]
     if hard.get("pool_source") != "current_cor_geo_model":
         raise ValueError("Hard pools must come from the current CoR-Geo run")
-    checkpoint = run_root / "checkpoints" / f"epoch_{source_epoch:03d}.ckpt"
-    checkpoint_hash = sha256_file(checkpoint)
-    root = _hard_pool_root(run_root, source_epoch, checkpoint_hash)
+    root = _hard_pool_root(run_cache_root, source_epoch)
     metadata_path = root / "refresh.metadata.json"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Current CoR-Geo hard pool is missing: {metadata_path}")
     with metadata_path.open("r", encoding="utf-8") as handle:
         refresh_metadata = json.load(handle)
+    checkpoint_hash = str(refresh_metadata.get("source_checkpoint_sha256", ""))
+    if len(checkpoint_hash) != 64:
+        raise ValueError("Hard-pool checkpoint hash is missing or malformed")
     expected = _expected_pool_metadata(
         source_epoch,
         checkpoint_hash,
@@ -813,7 +808,7 @@ def _generate_hard_pools(
     config: ExperimentConfig,
     source_epoch: int,
     source_checkpoint: Path,
-    run_root: Path,
+    run_cache_root: Path,
     device: torch.device,
     provenance: dict[str, Any],
     rank: int,
@@ -825,14 +820,29 @@ def _generate_hard_pools(
         rank,
     )
     hard = config.train["hard_mining"]
-    output_root = _hard_pool_root(run_root, source_epoch, checkpoint_hash)
-    complete = _broadcast(
-        (output_root / "refresh.metadata.json").is_file() if rank == 0 else None,
-        rank,
+    output_root = _hard_pool_root(run_cache_root, source_epoch)
+    expected_common = _expected_pool_metadata(
+        source_epoch,
+        checkpoint_hash,
+        provenance,
+        config.train,
     )
+    complete: bool | None = None
+    if rank == 0:
+        metadata_path = output_root / "refresh.metadata.json"
+        if metadata_path.is_file():
+            try:
+                with metadata_path.open("r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+                complete = all(metadata.get(key) == value for key, value in expected_common.items())
+            except (OSError, ValueError, TypeError):
+                complete = False
+        else:
+            complete = False
+    complete = _broadcast(complete, rank)
     if complete:
         return
-    staging_root = run_root / "artifacts" / ".hard_negative_staging" / checkpoint_hash / f"epoch_{source_epoch}"
+    staging_root = run_cache_root / ".hard_negative_staging" / f"epoch_{source_epoch:03d}"
     setup_error: str | None = None
     if rank == 0:
         try:
@@ -905,12 +915,7 @@ def _generate_hard_pools(
     expected_query_ids = train_manifest.iloc[shard_start:shard_stop]["query_id"].astype(str).tolist()
     if query_ids != expected_query_ids:
         raise ValueError("Ground mining order differs from train manifest")
-    common = _expected_pool_metadata(
-        source_epoch,
-        checkpoint_hash,
-        provenance,
-        config.train,
-    )
+    common = expected_common
     candidate_bank = HardNegativeCandidateBank(
         satellite_direction,
         device,
@@ -997,6 +1002,9 @@ def _generate_hard_pools(
                 },
             )
             shutil.rmtree(staging_root)
+            for previous_root in output_root.parent.glob("epoch_*"):
+                if previous_root != output_root and previous_root.is_dir():
+                    shutil.rmtree(previous_root)
         except Exception as error:
             publish_error = f"{type(error).__name__}: {error}"
     publish_error = _broadcast(publish_error, rank)
@@ -1026,7 +1034,7 @@ def _prepare_validation_schedule(
     allow_create: bool,
 ) -> tuple[dict[int, np.ndarray], pd.DataFrame, str, Path]:
     """Create one random validation schedule per run, then replay it forever."""
-    schedule_path = run_root / "evaluations" / f"{split}_random" / "random_crop_schedule.parquet"
+    schedule_path = run_root / "validation_schedule.parquet"
     result: tuple[dict[int, np.ndarray], pd.DataFrame, str] | None = None
     error: str | None = None
     if rank == 0:
@@ -1077,10 +1085,10 @@ def _update_best_validation(
     summary: dict[str, Any],
 ) -> bool:
     """Replace the best checkpoint only when Macro R@1 strictly improves."""
-    best_summary_path = run_root / "evaluations" / "val_random" / "best_summary.json"
+    best_metrics_path = run_root / "best_metrics.json"
     previous: dict[str, Any] | None = None
-    if best_summary_path.is_file():
-        with best_summary_path.open("r", encoding="utf-8") as handle:
+    if best_metrics_path.is_file():
+        with best_metrics_path.open("r", encoding="utf-8") as handle:
             previous = json.load(handle)
     current_score = float(summary["selection"]["macro_r1"])
     previous_score = float(previous["selection"]["macro_r1"]) if previous is not None else -math.inf
@@ -1095,20 +1103,38 @@ def _update_best_validation(
     if not improved and not recover_missing_checkpoint:
         return False
     _atomic_copy(checkpoint, best_checkpoint)
-    best_summary = dict(summary)
-    best_summary["selection"] = {
+    best_metrics = dict(summary)
+    best_metrics["checkpoint"] = str(best_checkpoint)
+    best_metrics["selection"] = {
         **summary["selection"],
         "best_checkpoint": str(best_checkpoint),
-        "source_checkpoint": str(checkpoint),
     }
-    write_json(best_summary_path, best_summary, overwrite=True)
+    write_json(best_metrics_path, best_metrics, overwrite=True)
     return improved
+
+
+def _append_validation_metrics(
+    metrics_path: Path,
+    summary: dict[str, Any],
+    *,
+    new_best: bool,
+    trigger: str,
+) -> Path:
+    """Append one complete validation event to the shared training log."""
+    record = {
+        **summary,
+        "record_type": "validation",
+        "epoch": int(summary["selected_epoch"]),
+        "trigger": trigger,
+        "new_best": bool(new_best),
+    }
+    return append_jsonl(metrics_path, record)
 
 
 def _run_training_validation(
     model: CoRGeoModel,
     config: ExperimentConfig,
-    run_root: Path,
+    run_cache_root: Path,
     checkpoint: Path,
     epoch: int,
     manifest: pd.DataFrame,
@@ -1123,31 +1149,9 @@ def _run_training_validation(
     """Evaluate one training checkpoint on the persistent random Val draw."""
     split = str(config.evaluation["report_split"])
     fovs = tuple(map(int, config.evaluation["main_fovs"]))
-    evaluation_root = run_root / "evaluations" / f"{split}_random" / f"epoch_{epoch:03d}"
-    summary_path = evaluation_root / "summary.json"
-    cached: dict[str, Any] | None = None
-    cached_error: str | None = None
-    if rank == 0 and summary_path.is_file():
-        try:
-            with summary_path.open("r", encoding="utf-8") as handle:
-                cached = json.load(handle)
-            if int(cached["selected_epoch"]) != epoch:
-                raise ValueError("Cached validation epoch is inconsistent")
-            if cached["random_crop_protocol"]["schedule_sha256"] != schedule_hash:
-                raise ValueError("Cached validation used a different crop schedule")
-        except Exception as exception:
-            cached_error = f"{type(exception).__name__}: {exception}"
-    cached_error = _broadcast(cached_error, rank)
-    if cached_error:
-        raise RuntimeError(f"Cached validation summary failed: {cached_error}")
-    cached_values = [cached if rank == 0 else None]
-    distributed.broadcast_object_list(cached_values, src=0)
-    if cached_values[0] is not None:
-        return cached_values[0] if rank == 0 else None
-
     model_config = config.model
     runtime = config.runtime
-    staging_root = evaluation_root / str(runtime["storage"]["staging_directory"])
+    staging_root = run_cache_root / "validation" / f"epoch_{epoch:03d}"
     setup_error: str | None = None
     if rank == 0:
         try:
@@ -1260,7 +1264,6 @@ def _run_training_validation(
         if rank == 0:
             try:
                 summary = {
-                    "output_directory": str(evaluation_root),
                     "dataset": str(config.dataset["dataset"]),
                     "selected_epoch": int(epoch),
                     "checkpoint": str(checkpoint),
@@ -1282,7 +1285,6 @@ def _run_training_validation(
                     },
                     "fovs": {},
                 }
-                prediction_root = evaluation_root / "predictions"
                 for fov in fovs:
                     parts = [
                         pd.read_parquet(
@@ -1300,14 +1302,12 @@ def _run_training_validation(
                         recall_ks=tuple(map(int, config.evaluation["metrics"]["recall_ks"])),
                         r1_percent_rounding=str(config.evaluation["metrics"]["r1_percent_rounding"]),
                     )
-                    write_parquet_atomic(predictions, prediction_root / f"{split}_fov{fov}.parquet")
                 macro_r1 = _macro_recall_at_1(summary, fovs)
                 summary["selection"] = {
                     "metric": "macro_r1",
                     "macro_r1": macro_r1,
                     "fovs": list(fovs),
                 }
-                write_json(summary_path, summary)
                 shutil.rmtree(staging_root)
             except Exception as exception:
                 publish_error = f"{type(exception).__name__}: {exception}"
@@ -1336,9 +1336,10 @@ def train(
     topology = resolve_training_topology(config.train, world_size)
     configure_determinism(seed)
     device = torch.device("cuda", local_rank)
-    project_root = Path(config.paths["project_root"])
+    project_root = Path(config.paths["project_root"]).resolve()
     dataset_name = str(config.dataset["dataset"])
     run_root = Path(config.paths["output_root"]) / dataset_name / run_name
+    run_cache_root = project_root / ".cache" / "cor_geo" / dataset_name / "runs" / run_name
     manifest_root = project_root / "data_manifests" / dataset_name
     manifest_splits = tuple(map(str, config.dataset["manifest_splits"]))
     manifest_paths = {split: manifest_root / f"{split}.parquet" for split in manifest_splits}
@@ -1402,7 +1403,7 @@ def train(
                 if run_root.exists():
                     raise FileExistsError(f"Run already exists: {run_root}")
                 run_root.mkdir(parents=True, exist_ok=False)
-                write_yaml(run_root / "config_resolved.yaml", config.as_dict())
+                write_yaml(run_root / "config.yaml", config.as_dict())
             elif not run_root.is_dir():
                 raise FileNotFoundError(f"Resume run does not exist: {run_root}")
         except Exception as error:
@@ -1419,6 +1420,7 @@ def train(
         rank,
         allow_create=resume is None,
     )
+    metrics_path = run_root / "train_metrics.jsonl"
 
     provenance = {
         "manifest_hashes": {split: sha256_file(path) for split, path in manifest_paths.items()},
@@ -1461,13 +1463,11 @@ def train(
     fovs = list(map(int, config.train["mixed_fov_batch"]["fovs"]))
     refresh_epochs = set(map(int, config.train["hard_mining"]["refresh_after_epochs"]))
     if (resume is not None) and completed_epoch % validation_interval == 0:
-        retained_checkpoint = run_root / "checkpoints" / f"epoch_{completed_epoch:03d}.ckpt"
-        if not retained_checkpoint.is_file():
-            retained_checkpoint = run_root / "checkpoints" / "last.ckpt"
+        retained_checkpoint = run_root / "checkpoints" / "last.ckpt"
         summary = _run_training_validation(
             model,
             config,
-            run_root,
+            run_cache_root,
             retained_checkpoint,
             completed_epoch,
             validation_manifest,
@@ -1481,12 +1481,16 @@ def train(
         )
         if rank == 0:
             assert summary is not None
-            _update_best_validation(run_root, retained_checkpoint, summary)
+            improved = _update_best_validation(run_root, retained_checkpoint, summary)
+            _append_validation_metrics(
+                metrics_path,
+                summary,
+                new_best=improved,
+                trigger="resume_recheck",
+            )
         distributed.barrier()
     if (resume is not None) and completed_epoch in refresh_epochs:
-        retained_checkpoint = run_root / "checkpoints" / f"epoch_{completed_epoch:03d}.ckpt"
-        if not retained_checkpoint.is_file():
-            retained_checkpoint = run_root / "checkpoints" / "last.ckpt"
+        retained_checkpoint = run_root / "checkpoints" / "last.ckpt"
         _generate_hard_pools(
             model,
             dataset,
@@ -1494,7 +1498,7 @@ def train(
             config,
             completed_epoch,
             retained_checkpoint,
-            run_root,
+            run_cache_root,
             device,
             provenance,
             rank,
@@ -1515,8 +1519,6 @@ def train(
         persistent_workers=bool(loader_config["persistent_workers"]),
         prefetch_factor=int(loader_config["prefetch_factor"]),
     )
-    metrics_path = run_root / "train_metrics.jsonl"
-    retained_epochs = set(map(int, config.train["checkpoint"]["retained_epochs"]))
     progress_every_steps = int(config.train["progress_every_steps"])
     for epoch in range(start_epoch, final_epoch + 1):
         ddp_model.train(True)
@@ -1525,7 +1527,7 @@ def train(
         hard_pools = None
         if rank == 0 and float(stage["hard_batch_fraction"]) > 0:
             hard_pools = _load_hard_pools(
-                run_root,
+                run_cache_root,
                 epoch,
                 fovs,
                 provenance,
@@ -1592,6 +1594,7 @@ def train(
                 append_jsonl(
                     metrics_path,
                     {
+                        "record_type": "train_step",
                         "epoch": epoch,
                         "step_in_epoch": step_in_epoch,
                         "global_step": scheduler.global_step,
@@ -1632,11 +1635,9 @@ def train(
                     "unique_locations",
                 ),
             )
-            epoch_checkpoint, _ = save_epoch_checkpoint(
+            epoch_checkpoint = save_last_checkpoint(
                 payload,
                 run_root / "checkpoints",
-                epoch,
-                retain_epoch=epoch in retained_epochs,
             )
         checkpoint_value = _broadcast(
             str(epoch_checkpoint) if rank == 0 else None,
@@ -1649,7 +1650,7 @@ def train(
             summary = _run_training_validation(
                 model,
                 config,
-                run_root,
+                run_cache_root,
                 Path(checkpoint_value),
                 epoch,
                 validation_manifest,
@@ -1664,6 +1665,12 @@ def train(
             if rank == 0:
                 assert summary is not None
                 improved = _update_best_validation(run_root, Path(checkpoint_value), summary)
+                _append_validation_metrics(
+                    metrics_path,
+                    summary,
+                    new_best=improved,
+                    trigger="scheduled",
+                )
                 fov_text = " | ".join(
                     f"R@1 {fov}° {100.0 * float(summary['fovs'][str(fov)]['R@1']):.1f}%"
                     for fov in validation_fovs
@@ -1683,7 +1690,7 @@ def train(
                 config,
                 epoch,
                 Path(checkpoint_value),
-                run_root,
+                run_cache_root,
                 device,
                 provenance,
                 rank,

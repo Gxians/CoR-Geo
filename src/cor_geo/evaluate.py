@@ -792,6 +792,31 @@ def load_random_crop_schedule(
     )
 
 
+def _resolve_evaluation_crop_schedule(
+    manifest: pd.DataFrame,
+    split: str,
+    fovs: tuple[int, ...],
+    crop_schedule: str | Path | None = None,
+    rng: np.random.Generator | None = None,
+) -> tuple[dict[int, np.ndarray], pd.DataFrame, str, str]:
+    """Load an explicit replay schedule or draw a fresh standalone-evaluation schedule."""
+    if crop_schedule is not None:
+        angles, schedule, schedule_hash = load_random_crop_schedule(
+            crop_schedule,
+            manifest,
+            split,
+            fovs,
+        )
+        return angles, schedule, schedule_hash, "user_supplied"
+    angles, schedule, schedule_hash = draw_random_crop_schedule(
+        manifest,
+        split,
+        fovs,
+        rng=rng,
+    )
+    return angles, schedule, schedule_hash, "new_random_draw"
+
+
 # ---- command-line interface ----
 
 """Exact evaluation with random or replayed FoV crops."""
@@ -885,26 +910,54 @@ def _resolve_run_dir(
     return output_root / dataset / f"cor_geo_{dataset}"
 
 
-def _load_model_checkpoint(
-    path: str | Path,
-    model: nn.Module,
-    expected_resolved_config: dict[str, Any],
-) -> dict[str, Any]:
-    """Load model weights and the provenance needed by standalone evaluation."""
+def _next_evaluation_root(run_dir: Path) -> Path:
+    """Return the next compact eval_NNN directory without overwriting earlier results."""
+    evaluation_parent = run_dir / "evaluations"
+    indices = []
+    if evaluation_parent.is_dir():
+        for child in evaluation_parent.iterdir():
+            if child.is_dir() and child.name.startswith("eval_") and child.name[5:].isdigit():
+                indices.append(int(child.name[5:]))
+    return evaluation_parent / f"eval_{max(indices, default=0) + 1:03d}"
+
+
+def _load_checkpoint_payload(path: str | Path) -> dict[str, Any]:
+    """Load and validate a self-contained CoR-Geo checkpoint."""
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
         raise FileNotFoundError(resolved)
     payload = torch.load(resolved, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"Invalid checkpoint payload: {resolved}")
-    if payload.get("resolved_config_sha256") != sha256_json(payload["resolved_config"]):
+    embedded_config = payload.get("resolved_config")
+    if not isinstance(embedded_config, dict):
+        raise ValueError("Checkpoint does not contain a complete resolved config")
+    if payload.get("resolved_config_sha256") != sha256_json(embedded_config):
         raise ValueError("Checkpoint resolved-config hash is inconsistent")
-    if payload["resolved_config_sha256"] != sha256_json(expected_resolved_config):
-        raise ValueError("Checkpoint resolved config differs from the requested run config")
+    return payload
+
+
+def _resolved_config_from_checkpoint(
+    payload: dict[str, Any],
+    recorded_run_config: str | Path,
+) -> dict[str, Any]:
+    """Use embedded configuration and optionally audit a training-run copy."""
+    embedded_config = payload["resolved_config"]
+    config_path = Path(recorded_run_config).expanduser().resolve()
+    if config_path.exists():
+        if not config_path.is_file():
+            raise ValueError(f"Recorded run config is not a file: {config_path}")
+        recorded_config = load_yaml(config_path)
+        if sha256_json(recorded_config) != payload["resolved_config_sha256"]:
+            raise ValueError("Recorded run config differs from the checkpoint embedded config")
+    return embedded_config
+
+
+def _load_model_checkpoint(payload: dict[str, Any], model: nn.Module) -> None:
+    """Restore model weights from an already validated checkpoint payload."""
     underlying = _underlying(model)
     underlying.load_state_dict(payload["model_state"], strict=True)
     underlying.set_train_epoch(int(payload["completed_epoch"]))
-    return payload
 
 
 def _save_encoded(root: Path, encoded: EncodedSatelliteViews) -> None:
@@ -1005,13 +1058,13 @@ def main() -> None:
         "--run-dir",
         help="Training run directory; defaults to outputs/<dataset>/cor_geo_<dataset>",
     )
-    parser.add_argument("--checkpoint", default="best")
+    parser.add_argument("--checkpoint", choices=("best", "last"), default="best")
     parser.add_argument("--split", choices=["val", "test"], default="val")
     parser.add_argument("--fovs", type=int, nargs="+", default=list(FOVS))
     parser.add_argument(
         "--crop-schedule",
         help=(
-            "Optional recorded random_crop_schedule.parquet to replay exactly. "
+            "Optional recorded crop schedule Parquet file to replay exactly. "
             "If omitted, a new independent random schedule is drawn."
         ),
     )
@@ -1038,7 +1091,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        help="Optional explicit output directory; defaults to a hash-named draw directory",
+        help="Optional explicit output directory; defaults to the next evaluations/eval_NNN directory",
     )
     parser.add_argument(
         "--satellite-bank-dir",
@@ -1053,13 +1106,15 @@ def main() -> None:
         raise ValueError(f"FoVs must be supplied in exact order {FOVS}")
     split = str(args.split)
     shared = load_yaml(args.config)
-    runtime = shared["runtime"]
+    run_dir = _resolve_run_dir(args.run_dir, args.dataset, shared["paths"])
+    checkpoint = _checkpoint_path(run_dir, args.checkpoint)
+    payload = _load_checkpoint_payload(checkpoint)
+    resolved = _resolved_config_from_checkpoint(payload, run_dir / "config.yaml")
+    runtime = resolved["runtime"]
     rank, local_rank, world_size = _initialize(runtime)
     device = torch.device("cuda", local_rank)
     succeeded = False
     try:
-        run_dir = _resolve_run_dir(args.run_dir, args.dataset, shared["paths"])
-        resolved = load_yaml(run_dir / "config_resolved.yaml")
         checkpoint_dataset_name = str(resolved["dataset"]["dataset"])
         if checkpoint_dataset_name != args.dataset:
             raise ValueError(
@@ -1086,46 +1141,22 @@ def main() -> None:
             dataset=dataset_name
         )
         eval_config = resolved["evaluation"]
-        paths = shared["paths"]
+        paths = resolved["paths"]
         configure_deterministic_algorithms()
-        checkpoint = _checkpoint_path(run_dir, args.checkpoint)
-        if not checkpoint.is_file():
-            raise FileNotFoundError(checkpoint)
-        checkpoint_label = checkpoint.stem
-        if checkpoint_label != "best" and not checkpoint_label.startswith("epoch_"):
-            raise ValueError("Checkpoint must be best.ckpt or a retained epoch_NNN.ckpt")
         checkpoint_hash = sha256_file(checkpoint)
-        project_root = Path(paths["project_root"])
+        project_root = Path(paths["project_root"]).resolve()
         manifest_root = project_root / "data_manifests" / dataset_name
         manifest_path = manifest_root / f"{split}.parquet"
         manifest = read_manifest(manifest_path).reset_index(drop=True)
         manifest_hash = sha256_file(manifest_path)
         schedule_values: list[tuple[dict[int, np.ndarray], pd.DataFrame, str, str] | None] = [None]
         if rank == 0:
-            if args.crop_schedule:
-                angles, schedule, crop_hash = load_random_crop_schedule(
-                    args.crop_schedule,
-                    manifest,
-                    split,
-                    active_fovs,
-                )
-                schedule_values[0] = (angles, schedule, crop_hash, "user_supplied")
-            elif split == "val" and active_fovs == FOVS:
-                persistent_schedule = run_dir / "evaluations" / "val_random" / "random_crop_schedule.parquet"
-                if persistent_schedule.is_file():
-                    angles, schedule, crop_hash = load_random_crop_schedule(
-                        persistent_schedule,
-                        manifest,
-                        split,
-                        active_fovs,
-                    )
-                    schedule_values[0] = (angles, schedule, crop_hash, "persistent_run_schedule")
-                else:
-                    angles, schedule, crop_hash = draw_random_crop_schedule(manifest, split, active_fovs)
-                    schedule_values[0] = (angles, schedule, crop_hash, "new_random_draw")
-            else:
-                angles, schedule, crop_hash = draw_random_crop_schedule(manifest, split, active_fovs)
-                schedule_values[0] = (angles, schedule, crop_hash, "new_random_draw")
+            schedule_values[0] = _resolve_evaluation_crop_schedule(
+                manifest,
+                split,
+                active_fovs,
+                crop_schedule=args.crop_schedule,
+            )
         distributed.broadcast_object_list(schedule_values, src=0)
         if schedule_values[0] is None:
             raise RuntimeError("Random crop schedule broadcast failed")
@@ -1136,25 +1167,11 @@ def main() -> None:
         model = CoRGeoModel(
             model_config,
             dinov2_root=paths["dinov2_root"],
-            checkpoint_path=paths["checkpoints"]["dinov2_vitb14"],
-        ).to(device)
-        payload = _load_model_checkpoint(
-            checkpoint,
-            model,
-            expected_resolved_config=resolved,
+            checkpoint_path=None,
         )
+        _load_model_checkpoint(payload, model)
+        model = model.to(device)
         selected_epoch = int(payload["completed_epoch"])
-        if checkpoint_label.startswith("epoch_") and int(checkpoint_label.removeprefix("epoch_")) != selected_epoch:
-            raise ValueError("Checkpoint epoch metadata differs from its filename")
-        if selected_epoch not in set(map(int, checkpoint_train_config["checkpoint"]["retained_epochs"])):
-            raise ValueError("Evaluation accepts best.ckpt or retained checkpoint epochs only")
-        saved_schedule_hash = payload.get("validation_crop_schedule_sha256")
-        if (
-            schedule_source == "persistent_run_schedule"
-            and saved_schedule_hash is not None
-            and saved_schedule_hash != crop_hash
-        ):
-            raise ValueError("The run's validation crop schedule differs from the checkpoint")
         expected = {"model": (payload["model_config_sha256"], model_config_hash)}
         if not cross_dataset:
             expected["manifest"] = (
@@ -1184,19 +1201,24 @@ def main() -> None:
             require_resized_cache=require_cache,
             dataset_name=dataset_name,
         )
-        evaluation_root = (
-            Path(args.output_dir).expanduser().resolve()
-            if args.output_dir
-            else (
-                run_dir / "evaluations" / f"{split}_random" / f"epoch_{selected_epoch:03d}" / f"draw_{crop_hash[:12]}"
+        evaluation_root_values: list[str | None] = [None]
+        if rank == 0:
+            evaluation_root_values[0] = str(
+                Path(args.output_dir).expanduser().resolve()
+                if args.output_dir
+                else _next_evaluation_root(run_dir)
             )
-        )
+        distributed.broadcast_object_list(evaluation_root_values, src=0)
+        if evaluation_root_values[0] is None:
+            raise RuntimeError("Evaluation output directory broadcast failed")
+        evaluation_root = Path(evaluation_root_values[0])
         summary_path = evaluation_root / "summary.json"
-        staging_root = evaluation_root / str(runtime["storage"]["staging_directory"])
+        run_cache_root = project_root / ".cache" / "cor_geo" / dataset_name / "runs" / run_dir.name
+        staging_root = run_cache_root / "evaluation_staging" / f"{checkpoint_hash[:12]}_{crop_hash[:12]}"
         bank_parent = (
             Path(args.satellite_bank_dir).expanduser().resolve()
             if args.satellite_bank_dir
-            else run_dir / "evaluations" / "shared_satellite_bank"
+            else run_cache_root / "satellite_banks"
         )
         bank_root = bank_parent / split / checkpoint_hash
         setup_error: str | None = None
@@ -1233,7 +1255,7 @@ def main() -> None:
                 if staging_root.exists():
                     shutil.rmtree(staging_root)
                 staging_root.mkdir(parents=True, exist_ok=False)
-                schedule_path = evaluation_root / "random_crop_schedule.parquet"
+                schedule_path = evaluation_root / "crop_schedule.parquet"
                 write_parquet_atomic(random_crop_schedule, schedule_path)
             except Exception as error:
                 setup_error = f"{type(error).__name__}: {error}"
@@ -1383,10 +1405,9 @@ def main() -> None:
                     "operation": "right_roll_then_left_fov_crop",
                     "independent_random_angle_per_query_fov": True,
                     "schedule_source": schedule_source,
-                    "schedule": str(evaluation_root / "random_crop_schedule.parquet"),
+                    "schedule": str(evaluation_root / "crop_schedule.parquet"),
                     "schedule_sha256": crop_hash,
                 }
-                prediction_root = evaluation_root / "predictions"
                 for fov in active_fovs:
                     parts = [
                         pd.read_parquet(
@@ -1403,10 +1424,6 @@ def main() -> None:
                         len(manifest),
                         recall_ks=(1, 5, 10),
                         r1_percent_rounding=str(eval_config["metrics"]["r1_percent_rounding"]),
-                    )
-                    write_parquet_atomic(
-                        predictions,
-                        prediction_root / f"{split}_fov{fov}.parquet",
                     )
                     summary["fovs"][str(fov)] = metrics
                 write_json(summary_path, summary)

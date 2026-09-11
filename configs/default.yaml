@@ -293,19 +293,6 @@ train:
     candidate_strategy: signed_dc_low2_fft_magnitude_top512_exact_cyclic_hardmax_top64_v1
     crop_orientation_contract: source_epoch_pool_equals_hard_batch
     storage_format: dense_ranked_location_indices_v1
-  checkpoint:
-    save_last: true
-    save_full_epochs: true
-    retained_epochs:
-    - 8
-    - 16
-    - 24
-    - 32
-    - 40
-    - 48
-    - 56
-    - 64
-    resume_boundary: epoch_end
 evaluation:
   report_split: val
   main_fovs:
@@ -341,7 +328,3 @@ runtime:
   exact_score:
     query_chunk_size: 128
     location_chunk_size: 2048
-  storage:
-    descriptor_dtype: float32
-    prediction_shards: parquet
-    staging_directory: .evaluation_staging

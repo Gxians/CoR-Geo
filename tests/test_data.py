@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 import yaml
 from PIL import Image
 
@@ -23,18 +24,29 @@ from cor_geo.datasets import (
 )
 from cor_geo.evaluate import (
     _checkpoint_path,
+    _load_checkpoint_payload,
+    _next_evaluation_root,
+    _resolve_evaluation_crop_schedule,
     _resolve_run_dir,
+    _resolved_config_from_checkpoint,
     draw_random_crop_schedule,
     retrieval_metrics,
     validate_random_crop_schedule,
 )
 from cor_geo.samplers import PlannedRankBatchSampler, build_epoch_plan
-from cor_geo.train import _macro_recall_at_1, _parse_device_ids, _update_best_validation
+from cor_geo.train import (
+    _append_validation_metrics,
+    _macro_recall_at_1,
+    _parse_device_ids,
+    _update_best_validation,
+    save_last_checkpoint,
+)
 from cor_geo.utils import (
     ConfigError,
     load_experiment_config,
     load_yaml,
     resolve_training_topology,
+    sha256_json,
     validate_experiment_config,
 )
 
@@ -55,6 +67,7 @@ def test_public_configuration_is_valid_and_portable(dataset: str) -> None:
         "interval_epochs": 8,
         "selection_metric": "macro_r1",
     }
+    assert "checkpoint" not in config.train
 
 
 def test_validation_accepts_structurally_valid_experiment_variants() -> None:
@@ -93,10 +106,54 @@ def test_evaluation_defaults_to_the_standard_run_and_best_checkpoint(tmp_path: P
     run_dir = _resolve_run_dir(None, "cvact", paths)
     assert run_dir == tmp_path / "outputs" / "cvact" / "cor_geo_cvact"
     assert _checkpoint_path(run_dir, "best") == run_dir / "checkpoints" / "best.ckpt"
-    assert _checkpoint_path(run_dir, "epoch_008.ckpt") == run_dir / "checkpoints" / "epoch_008.ckpt"
+    assert _checkpoint_path(run_dir, "last") == run_dir / "checkpoints" / "last.ckpt"
 
     explicit = _resolve_run_dir("custom/run", "cvact", paths)
     assert explicit == Path("custom/run").resolve()
+
+
+def test_evaluation_uses_checkpoint_config_without_run_config(tmp_path: Path) -> None:
+    resolved_config = {
+        "dataset": {"dataset": "cvact"},
+        "model": {"name": "cor_geo"},
+    }
+    payload = {
+        "resolved_config": resolved_config,
+        "resolved_config_sha256": sha256_json(resolved_config),
+    }
+    checkpoint = tmp_path / "checkpoints" / "best.ckpt"
+    checkpoint.parent.mkdir(parents=True)
+    torch.save(payload, checkpoint)
+
+    loaded = _load_checkpoint_payload(checkpoint)
+    run_config = tmp_path / "config.yaml"
+    assert _resolved_config_from_checkpoint(loaded, run_config) == resolved_config
+
+    run_config.write_text(yaml.safe_dump(resolved_config), encoding="utf-8")
+    assert _resolved_config_from_checkpoint(loaded, run_config) == resolved_config
+
+    run_config.write_text(yaml.safe_dump({"dataset": {"dataset": "cvusa"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from the checkpoint embedded config"):
+        _resolved_config_from_checkpoint(loaded, run_config)
+
+
+def test_evaluation_directories_use_compact_monotonic_names(tmp_path: Path) -> None:
+    run_dir = tmp_path / "outputs" / "cvact" / "cor_geo_cvact"
+    assert _next_evaluation_root(run_dir) == run_dir / "evaluations" / "eval_001"
+    (run_dir / "evaluations" / "eval_001").mkdir(parents=True)
+    (run_dir / "evaluations" / "eval_003").mkdir()
+    (run_dir / "evaluations" / "notes").mkdir()
+    assert _next_evaluation_root(run_dir) == run_dir / "evaluations" / "eval_004"
+
+
+def test_training_checkpoint_directory_keeps_only_last_and_best(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "run" / "checkpoints"
+    last = save_last_checkpoint({"completed_epoch": 1}, checkpoint_dir)
+    assert last == checkpoint_dir / "last.ckpt"
+    assert sorted(path.name for path in checkpoint_dir.iterdir()) == ["last.ckpt"]
+
+    save_last_checkpoint({"completed_epoch": 2}, checkpoint_dir)
+    assert sorted(path.name for path in checkpoint_dir.iterdir()) == ["last.ckpt"]
 
 
 def test_one_gpu_batch_matches_the_two_contiguous_rank_shards() -> None:
@@ -204,9 +261,41 @@ def test_random_validation_schedule_can_be_replayed_for_all_fovs() -> None:
     assert all((replayed_angles[fov] == angles[fov]).all() for fov in fovs)
 
 
+def test_standalone_evaluation_draws_fresh_schedules_unless_replay_is_requested(tmp_path: Path) -> None:
+    manifest = pd.DataFrame({"query_id": [f"q{index}" for index in range(32)]})
+    fovs = (360, 180, 90, 70)
+    _, first, first_hash, first_source = _resolve_evaluation_crop_schedule(
+        manifest,
+        "val",
+        fovs,
+        rng=np.random.default_rng(7),
+    )
+    _, second, second_hash, second_source = _resolve_evaluation_crop_schedule(
+        manifest,
+        "val",
+        fovs,
+        rng=np.random.default_rng(8),
+    )
+    assert first_source == second_source == "new_random_draw"
+    assert first_hash != second_hash
+    assert not first.equals(second)
+
+    replay_path = tmp_path / "crop_schedule.parquet"
+    write_parquet_atomic(first, replay_path)
+    _, replayed, replayed_hash, replayed_source = _resolve_evaluation_crop_schedule(
+        manifest,
+        "val",
+        fovs,
+        crop_schedule=replay_path,
+    )
+    assert replayed_source == "user_supplied"
+    assert replayed_hash == first_hash
+    assert replayed.equals(first)
+
+
 def test_best_checkpoint_uses_macro_r1_and_keeps_the_earliest_tie(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
-    first = run_root / "checkpoints" / "epoch_008.ckpt"
+    first = run_root / "checkpoints" / "last.ckpt"
     first.parent.mkdir(parents=True)
     first.write_bytes(b"epoch-8")
     summary = {
@@ -220,12 +309,38 @@ def test_best_checkpoint_uses_macro_r1_and_keeps_the_earliest_tie(tmp_path: Path
     }
     assert _update_best_validation(run_root, first, summary)
     assert (run_root / "checkpoints" / "best.ckpt").read_bytes() == b"epoch-8"
+    assert (run_root / "best_metrics.json").is_file()
+    assert sorted(path.name for path in first.parent.iterdir()) == ["best.ckpt", "last.ckpt"]
 
-    tied = run_root / "checkpoints" / "epoch_016.ckpt"
-    tied.write_bytes(b"epoch-16")
+    first.write_bytes(b"epoch-16")
     tied_summary = {**summary, "selected_epoch": 16}
-    assert not _update_best_validation(run_root, tied, tied_summary)
+    assert not _update_best_validation(run_root, first, tied_summary)
     assert (run_root / "checkpoints" / "best.ckpt").read_bytes() == b"epoch-8"
+
+
+def test_validation_metrics_are_appended_to_the_training_log(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "run" / "train_metrics.jsonl"
+    summaries = []
+    for epoch, value in ((8, 0.5), (16, 0.6)):
+        summaries.append(
+            {
+                "dataset": "cvact",
+                "selected_epoch": epoch,
+                "checkpoint_sha256": f"checkpoint-{epoch}",
+                "split": "val",
+                "fovs": {str(fov): {"R@1": value} for fov in (360, 180, 90, 70)},
+                "selection": {"metric": "macro_r1", "macro_r1": value, "fovs": [360, 180, 90, 70]},
+            }
+        )
+
+    _append_validation_metrics(metrics_path, summaries[0], new_best=True, trigger="scheduled")
+    _append_validation_metrics(metrics_path, summaries[1], new_best=False, trigger="scheduled")
+
+    records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["epoch"] for record in records] == [8, 16]
+    assert all(record["record_type"] == "validation" for record in records)
+    assert [record["new_best"] for record in records] == [True, False]
+    assert records[1]["fovs"]["70"]["R@1"] == pytest.approx(0.6)
 
 
 def test_manifest_paths_remain_repository_relative(tmp_path: Path) -> None:

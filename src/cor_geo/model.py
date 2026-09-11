@@ -39,7 +39,7 @@ def _unwrap_checkpoint(value: Any) -> dict[str, Tensor]:
 
 
 class DINOv2Backbone(nn.Module):
-    """Load one shared DINOv2 and expose only its normalized patch grid."""
+    """Build one shared DINOv2 and expose only its normalized patch grid."""
 
     def __init__(
         self,
@@ -54,27 +54,28 @@ class DINOv2Backbone(nn.Module):
         self.output_dim = int(config["output_dim"])
         self.finetuning = config["finetuning"]
         if model is None:
-            if dinov2_root is None or checkpoint_path is None:
-                raise ValueError("dinov2_root and checkpoint_path are required when no model is injected")
+            if dinov2_root is None:
+                raise ValueError("dinov2_root is required when no model is injected")
             root = Path(dinov2_root).expanduser().resolve()
-            checkpoint = Path(checkpoint_path).expanduser().resolve()
             if not root.is_dir():
                 raise FileNotFoundError(f"DINOv2 repository is missing: {root}")
-            if not checkpoint.is_file():
-                raise FileNotFoundError(f"DINOv2 checkpoint is missing: {checkpoint}")
             model = torch.hub.load(
                 repo_or_dir=str(root),
                 model=config["name"],
                 source="local",
                 pretrained=False,
             )
-            state = _unwrap_checkpoint(torch.load(checkpoint, map_location="cpu", weights_only=True))
-            incompatible = model.load_state_dict(state, strict=bool(config["strict_checkpoint"]))
-            if incompatible.missing_keys or incompatible.unexpected_keys:
-                raise ValueError(
-                    f"DINO checkpoint mismatch: missing={incompatible.missing_keys}, "
-                    f"unexpected={incompatible.unexpected_keys}"
-                )
+            if checkpoint_path is not None:
+                checkpoint = Path(checkpoint_path).expanduser().resolve()
+                if not checkpoint.is_file():
+                    raise FileNotFoundError(f"DINOv2 checkpoint is missing: {checkpoint}")
+                state = _unwrap_checkpoint(torch.load(checkpoint, map_location="cpu", weights_only=True))
+                incompatible = model.load_state_dict(state, strict=bool(config["strict_checkpoint"]))
+                if incompatible.missing_keys or incompatible.unexpected_keys:
+                    raise ValueError(
+                        f"DINO checkpoint mismatch: missing={incompatible.missing_keys}, "
+                        f"unexpected={incompatible.unexpected_keys}"
+                    )
         self.model = model
         if not hasattr(self.model, "blocks") or not hasattr(self.model, "norm"):
             raise ValueError("DINO model must expose blocks and norm")

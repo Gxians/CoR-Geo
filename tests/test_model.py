@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -11,7 +12,7 @@ from cor_geo.content_order import (
     ContentOrderEncoder,
 )
 from cor_geo.losses import CoRGeoLoss
-from cor_geo.model import CoRGeoModel
+from cor_geo.model import CoRGeoModel, DINOv2Backbone
 
 
 class _ScaleBlock(nn.Module):
@@ -150,3 +151,39 @@ def test_dino_suffix_activates_only_at_its_scheduled_epoch() -> None:
     assert model.backbone.active_indices == (2, 3)
     assert all(not parameter.requires_grad for block in model.backbone.blocks[:2] for parameter in block.parameters())
     assert all(parameter.requires_grad for block in model.backbone.blocks[2:] for parameter in block.parameters())
+
+
+def test_dino_structure_can_be_built_without_loading_base_weights(monkeypatch, tmp_path) -> None:
+    created = _TinyDINO()
+    calls: list[dict] = []
+
+    def fake_hub_load(**kwargs):
+        calls.append(kwargs)
+        return created
+
+    monkeypatch.setattr(torch.hub, "load", fake_hub_load)
+    backbone = DINOv2Backbone(
+        _tiny_config()["backbone"],
+        dinov2_root=tmp_path,
+        checkpoint_path=None,
+    )
+
+    assert backbone.model is created
+    assert calls == [
+        {
+            "repo_or_dir": str(tmp_path.resolve()),
+            "model": "tiny_dino",
+            "source": "local",
+            "pretrained": False,
+        }
+    ]
+
+
+def test_explicit_dino_initialization_still_requires_base_weights(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(torch.hub, "load", lambda **_: _TinyDINO())
+    with pytest.raises(FileNotFoundError, match="DINOv2 checkpoint is missing"):
+        DINOv2Backbone(
+            _tiny_config()["backbone"],
+            dinov2_root=tmp_path,
+            checkpoint_path=tmp_path / "missing.pth",
+        )

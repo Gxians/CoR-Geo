@@ -527,15 +527,6 @@ def validate_experiment_config(config: ExperimentConfig) -> None:
     _expect(all(int(value) > 0 for value in metrics["recall_ks"]), "Recall cutoffs must be positive")
     _expect(metrics["r1_percent_rounding"] in {"floor", "ceil"}, "Unsupported R@1% rounding")
 
-    retained = list(map(int, config.train["checkpoint"]["retained_epochs"]))
-    _expect(
-        len(retained) == len(set(retained)) and all(1 <= epoch <= epochs for epoch in retained),
-        "Retained checkpoint epochs are invalid",
-    )
-    validation_epochs = set(range(interval, epochs + 1, interval))
-    _expect(validation_epochs <= set(retained), "Every automatic validation epoch must retain a checkpoint")
-
-
 def resolve_project_path(path: str | Path, project_root: str | Path) -> Path:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
