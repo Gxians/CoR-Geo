@@ -1,4 +1,4 @@
-# CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization
+# CoR-Geo: Weakly Ordered Azimuthal Representation for Limited-FoV Cross-View Geo-Localization
 
 Paper link : [[arXiv](https://arxiv.org/abs/XXXX.XXXXX)]
 
@@ -6,7 +6,7 @@ The following is the official method implementation of CoR-Geo.
 
 ## Introduction
 
-CoR-Geo addresses limited-FoV cross-view geo-localization under unknown relative headings. It organizes ground patch columns and satellite rays into direction-level weakly ordered representations, avoiding dense vertical--radial alignment. FoV-masked cyclic matching enables one model and one pre-encoded satellite gallery to support multiple FoVs without heading supervision.
+CoR-Geo addresses limited-FoV cross-view geo-localization under unknown headings. It represents ground patch columns and satellite patch rays as weakly ordered azimuthal sequences, retaining cross-view-comparable azimuthal structure without assuming fine-grained local correspondence. A shared Content--Order aggregator with FoV-masked cyclic matching enables one model to reuse a pre-encoded satellite gallery across multiple FoVs, without heading supervision or FoV-specific training.
 
 <p align="center">
   <img src="assets/architecture.png" width="100%" alt="CoR-Geo architecture">
@@ -32,21 +32,15 @@ conda activate cor_geo
 pip install -e .
 ```
 
-#### DINOv2 Backbone
+### DINOv2 Backbone
 
-CoR-Geo uses the official [DINOv2](https://github.com/facebookresearch/dinov2) ViT-B/14 implementation. To evaluate a released CoR-Geo checkpoint, set up the pinned DINOv2 source only:
-
-```bash
-bash scripts/setup_dinov2.sh --source-only
-```
-
-To train CoR-Geo from the DINOv2 pretrained initialization, also download the ViT-B/14 weights:
+CoR-Geo uses the official [DINOv2](https://github.com/facebookresearch/dinov2) ViT-B/14 implementation and pretrained weights. Run:
 
 ```bash
 bash scripts/setup_dinov2.sh
 ```
 
-The complete CoR-Geo checkpoint already contains all backbone parameters, so the separate DINOv2 pretrained checkpoint is not required for evaluation.
+The script downloads a pinned DINOv2 source revision and the ViT-B/14 pretrained checkpoint.
 
 ## Dataset Preparation
 
@@ -62,7 +56,7 @@ Replace `cvact` with `cvusa` to prepare CVUSA.
 
 ## Usage
 
-#### Training
+### Training
 
 Train on CVACT using one GPU:
 
@@ -78,11 +72,11 @@ python -m cor_geo.train --dataset cvact --devices 0,1
 
 Replace `cvact` with `cvusa` to train on CVUSA.
 
-Training evaluates the Val split every 8 epochs at 360°, 180°, 90°, and 70°, and selects `best.ckpt` by the four-FoV Macro R@1. Training and validation metrics are recorded in `train_metrics.jsonl`.
+Training evaluates the Val split every 8 epochs at 360°, 180°, 90°, and 70°, and selects `best.ckpt` by the four-FoV Avg. R@1. Training and validation metrics are recorded in `train_metrics.jsonl`.
 
 To continue an interrupted run, append `--resume <checkpoint>`.
 
-#### Evaluation
+### Evaluation
 
 Evaluate a checkpoint under random FoV crops:
 
@@ -98,9 +92,9 @@ You can download the pretrained weights for cvusa and cvact here
 
 ## Results
 
-Validation Macro R@1 averaged over 360°, 180°, 90°, and 70° random crops:
+Validation Avg. R@1 over 360°, 180°, 90°, and 70° random crops:
 
-| Dataset | Checkpoint | Macro R@1 (%) |
+| Dataset | Checkpoint | Avg. R@1 (%) |
 |:--|:--:|--:|
 | CVACT | [Pretrained model](CVACT_PRETRAINED_MODEL_URL) | 75.4 |
 | CVUSA | [Pretrained model](CVUSA_PRETRAINED_MODEL_URL) | 79.8 |
@@ -117,7 +111,7 @@ If you find this work useful, please consider citing:
 
 ```bibtex
 @article{author2026corgeo,
-  title   = {CoR-Geo: Weakly Ordered Directional Representation for Limited-FoV Cross-View Geo-Localization},
+  title   = {CoR-Geo: Weakly Ordered Azimuthal Representation for Limited-FoV Cross-View Geo-Localization},
   author  = {...},
   journal = {arXiv preprint arXiv:XXXX.XXXXX},
   year    = {2026}
