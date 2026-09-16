@@ -84,6 +84,8 @@ python -m cor_geo.evaluate --dataset cvact
 
 By default, this command evaluates `best.ckpt` with newly sampled random FoV crops. Replace `cvact` with `cvusa` for CVUSA, or use `--checkpoint last` to evaluate the latest checkpoint.
 
+Pretrained CVACT and CVUSA checkpoints are available on [Hugging Face](https://huggingface.co/GxianS/CoR-Geo). Place the corresponding `best.ckpt` under `outputs/<dataset>/cor_geo_<dataset>/checkpoints/` before evaluation.
+
 ## Results
 
 R@1 (%) on the CVACT and CVUSA validation sets under random FoV crops:
