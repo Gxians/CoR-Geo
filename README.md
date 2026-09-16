@@ -1,7 +1,5 @@
 # CoR-Geo: Weakly Ordered Azimuthal Representation for Limited-FoV Cross-View Geo-Localization
 
-Paper link : [[arXiv](https://arxiv.org/abs/XXXX.XXXXX)]
-
 The following is the official method implementation of CoR-Geo.
 
 ## Introduction
@@ -86,34 +84,17 @@ python -m cor_geo.evaluate --dataset cvact
 
 By default, this command evaluates `best.ckpt` with newly sampled random FoV crops. Replace `cvact` with `cvusa` for CVUSA, or use `--checkpoint last` to evaluate the latest checkpoint.
 
-You can download the pretrained weights for cvusa and cvact here 
-[CVUSA](CVACT_PRETRAINED_MODEL_URL)
-, [CVACT](CVACT_PRETRAINED_MODEL_URL)
-
 ## Results
 
-Validation Avg. R@1 over 360°, 180°, 90°, and 70° random crops:
+R@1 (%) on the CVACT and CVUSA validation sets under random FoV crops:
 
-| Dataset | Checkpoint | Avg. R@1 (%) |
-|:--|:--:|--:|
-| CVACT | [Pretrained model](CVACT_PRETRAINED_MODEL_URL) | 75.4 |
-| CVUSA | [Pretrained model](CVUSA_PRETRAINED_MODEL_URL) | 79.8 |
+| Dataset | 360° | 180° | 90° | 70° | Avg. |
+|:--|--:|--:|--:|--:|--:|
+| CVACT | 89.8 | 84.8 | 68.7 | 58.5 | 75.4 |
+| CVUSA | 95.0 | 90.0 | 72.2 | 61.9 | 79.8 |
 
 ## Acknowledgements
 
 Parts of this repo are inspired by the following repositories:
 
 [DINOv2](https://github.com/facebookresearch/dinov2)
-
-## Citation
-
-If you find this work useful, please consider citing:
-
-```bibtex
-@article{author2026corgeo,
-  title   = {CoR-Geo: Weakly Ordered Azimuthal Representation for Limited-FoV Cross-View Geo-Localization},
-  author  = {...},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
-  year    = {2026}
-}
-```
